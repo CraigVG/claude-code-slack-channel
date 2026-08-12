@@ -27,6 +27,7 @@ import {
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildEditMessagePayload,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   type ChannelPolicy,
@@ -12997,6 +12998,7 @@ describe('MCP tool input schemas (S5)', () => {
       message_id: z.string().min(1),
       text: z.string().min(1),
       thread_ts: z.string().optional(),
+      blocks: z.array(z.record(z.string(), z.unknown())).optional(),
     })
     .strict()
 
@@ -13206,6 +13208,60 @@ describe('MCP tool input schemas (S5)', () => {
       expect(result.success).toBe(false)
       if (!result.success) {
         expect(result.error.issues.some((i) => i.path.join('.') === 'message_id')).toBe(true)
+      }
+    })
+
+    // ccsc — Block Kit edits. chat.update replaces a message wholesale, so
+    // editing a blocks message with text alone strips its layout; the tool
+    // needs a blocks channel to re-send the layout with the update.
+    test('accepts optional blocks alongside the required text fallback', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        text: 'updated fallback',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'hi' } }],
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.blocks).toHaveLength(1)
+        expect(result.data.text).toBe('updated fallback')
+      }
+    })
+
+    test('still accepts a text-only edit (blocks stays optional)', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        text: 'updated',
+      })
+      expect(result.success).toBe(true)
+      if (result.success) expect(result.data.blocks).toBeUndefined()
+    })
+
+    test('rejects non-array blocks', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        text: 'updated',
+        blocks: { type: 'section' },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'blocks')).toBe(true)
+      }
+    })
+
+    // text stays required even with blocks: Slack needs a notification
+    // fallback, and dropping it would regress push and accessibility text.
+    test('rejects blocks without text (fallback is not optional)', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'hi' } }],
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'text')).toBe(true)
       }
     })
   })
@@ -19504,6 +19560,230 @@ describe('replaceClickedActionsBlock', () => {
     const out = replaceClickedActionsBlock([section, actions], 'missing', 'X', 'U123')
     expect((out[0] as { type: string }).type).toBe('section')
     expect((out[1] as { type: string }).type).toBe('actions')
+  })
+
+  // Container blocks (Slack's `card`) nest their own `blocks` array. Before the
+  // recursion the swap only scanned the top level, so a click on a card-nested
+  // button fired but nothing changed on the message — it read as a dead button.
+  describe('nested container blocks (card)', () => {
+    const cardWithButtons = {
+      type: 'card',
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: 'inside the card' } },
+        {
+          type: 'actions',
+          elements: [
+            { type: 'button', action_id: 'card_opt', text: { type: 'plain_text', text: 'Go' } },
+          ],
+        },
+      ],
+    }
+
+    test('swaps an actions block nested inside a card', () => {
+      const out = replaceClickedActionsBlock([cardWithButtons], 'card_opt', 'Go', 'U123')
+      const card = out[0] as { type: string; blocks: Array<{ type: string }> }
+      expect(card.type).toBe('card')
+      // The card survives; only its actions block becomes the confirmation.
+      expect(card.blocks[0]!.type).toBe('section')
+      expect(card.blocks[1]!.type).toBe('context')
+      const ctxBlock = card.blocks[1] as unknown as { elements: Array<{ text: string }> }
+      expect(ctxBlock.elements[0]!.text).toContain('*Go*')
+      expect(ctxBlock.elements[0]!.text).toContain('<@U123>')
+    })
+
+    test('leaves a card untouched when the click was elsewhere', () => {
+      const out = replaceClickedActionsBlock([cardWithButtons], 'unrelated', 'X', 'U123')
+      const card = out[0] as { type: string; blocks: Array<{ type: string }> }
+      expect(card.blocks[1]!.type).toBe('actions')
+    })
+
+    test('does not mutate the input blocks', () => {
+      const out = replaceClickedActionsBlock([cardWithButtons], 'card_opt', 'Go', 'U123')
+      // Original still has its live actions block — the swap returned a copy.
+      expect(cardWithButtons.blocks[1]!.type).toBe('actions')
+      expect(out[0]).not.toBe(cardWithButtons)
+    })
+
+    test('reaches a button nested two containers deep', () => {
+      const nested = {
+        type: 'card',
+        blocks: [
+          {
+            type: 'card',
+            blocks: [
+              {
+                type: 'actions',
+                elements: [
+                  {
+                    type: 'button',
+                    action_id: 'deep',
+                    text: { type: 'plain_text', text: 'D' },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }
+      const out = replaceClickedActionsBlock([nested], 'deep', 'D', 'U9')
+      const outer = out[0] as { blocks: Array<{ blocks: Array<{ type: string }> }> }
+      expect(outer.blocks[0]!.blocks[0]!.type).toBe('context')
+    })
+
+    test('tolerates null and primitive entries in a blocks array', () => {
+      const out = replaceClickedActionsBlock([null, 'str', 7, actions], 'opt_b', 'B', 'U1')
+      expect(out[0]).toBeNull()
+      expect(out[1]).toBe('str')
+      expect(out[2]).toBe(7)
+      expect((out[3] as { type: string }).type).toBe('context')
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// edit_message Block Kit support — chat.update replaces a message wholesale,
+// so an edit that carries only `text` strips the message's blocks. These pin
+// the payload contract and the guard parity with the reply path.
+// ---------------------------------------------------------------------------
+
+describe('buildEditMessagePayload', () => {
+  test('text-only edit omits the blocks key entirely', () => {
+    const payload = buildEditMessagePayload({
+      chat_id: 'C1',
+      message_id: '111.222',
+      text: 'hello',
+    })
+    expect(payload).toEqual({ channel: 'C1', ts: '111.222', text: 'hello' })
+    // Not merely undefined — the key must be absent so the pre-blocks
+    // payload shape is unchanged for every existing caller.
+    expect(Object.hasOwn(payload, 'blocks')).toBe(false)
+  })
+
+  test('explicit undefined blocks also omits the key', () => {
+    const payload = buildEditMessagePayload({
+      chat_id: 'C1',
+      message_id: '111.222',
+      text: 'hello',
+      blocks: undefined,
+    })
+    expect(Object.hasOwn(payload, 'blocks')).toBe(false)
+  })
+
+  test('carries blocks AND keeps text as the notification fallback', () => {
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: 'rich' } }]
+    const payload = buildEditMessagePayload({
+      chat_id: 'C1',
+      message_id: '111.222',
+      text: 'fallback',
+      blocks,
+    })
+    expect(payload.blocks).toEqual(blocks)
+    // Dropping text here is the regression that costs push/notification text.
+    expect(payload.text).toBe('fallback')
+    expect(payload.channel).toBe('C1')
+    expect(payload.ts).toBe('111.222')
+  })
+
+  test('an empty blocks array is still sent (it is how you clear a layout)', () => {
+    const payload = buildEditMessagePayload({
+      chat_id: 'C1',
+      message_id: '111.222',
+      text: 'plain now',
+      blocks: [],
+    })
+    expect(Object.hasOwn(payload, 'blocks')).toBe(true)
+    expect(payload.blocks).toEqual([])
+  })
+})
+
+describe('edit_message blocks — guard parity with the reply path', () => {
+  // The reply path runs TWO guards over blocks (server.ts executeReply):
+  // the value-exfiltration guard over the serialized blocks, and the
+  // reserved perm: namespace check. An edit path that accepted blocks
+  // without both would be a bypass with an identical payload.
+  const sliceHandler = (from: string, to: string): string => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = src.indexOf(from)
+    expect(start).toBeGreaterThan(-1)
+    const end = src.indexOf(to, start)
+    expect(end).toBeGreaterThan(start)
+    return src.slice(start, end)
+  }
+  const editHandler = sliceHandler(
+    'async function executeEditMessage(',
+    '\nasync function executeFetchMessages(',
+  )
+
+  // The reply path's own blocks guards had no wiring coverage: deleting the
+  // perm: check from executeReply left the whole suite green (found while
+  // mutation-testing the edit path). Pin both paths so neither can lose a
+  // guard silently in a future refactor.
+  const replyHandler = sliceHandler(
+    'async function executeReply(',
+    '\nasync function executeReact(',
+  )
+
+  test('reply path still guards serialized blocks (pre-existing coverage gap)', () => {
+    expect(replyHandler).toContain("guardOutboundSecretValues(JSON.stringify(blocks), 'reply'")
+  })
+
+  test('reply path still runs the reserved perm: namespace check', () => {
+    expect(replyHandler).toContain('findReservedActionId(blocks)')
+    expect(replyHandler).toMatch(/throw new Error\(\s*`reply: blocks may not use the reserved/)
+  })
+
+  test('serializes blocks through the value-exfiltration guard', () => {
+    expect(editHandler).toContain(
+      "guardOutboundSecretValues(JSON.stringify(blocks), 'edit_message'",
+    )
+  })
+
+  test('runs the reserved perm: namespace check on blocks', () => {
+    expect(editHandler).toContain('findReservedActionId(blocks)')
+    expect(editHandler).toMatch(
+      /throw new Error\(\s*`edit_message: blocks may not use the reserved/,
+    )
+  })
+
+  test('guards run before the gate.outbound.allow event', () => {
+    // A blocked edit was never allowed — the allow event must not be
+    // journaled ahead of the guards.
+    const guardIdx = editHandler.indexOf('findReservedActionId(blocks)')
+    const allowIdx = editHandler.indexOf("kind: 'gate.outbound.allow'")
+    expect(guardIdx).toBeGreaterThan(-1)
+    expect(allowIdx).toBeGreaterThan(guardIdx)
+  })
+
+  test('the handler forwards blocks into the chat.update payload', () => {
+    // Guarding blocks but never sending them would be a silent no-op: the
+    // tool would accept the argument and still strip the message's layout.
+    expect(editHandler).toContain('buildEditMessagePayload({')
+    expect(editHandler).toMatch(/buildEditMessagePayload\(\{[\s\S]*?\bblocks,[\s\S]*?\}\)/)
+  })
+
+  test('the real EditMessageInput in server.ts declares blocks', () => {
+    // The schema under test above is a MIRROR (importing server.ts would run
+    // its bootstrap). Pin the real declaration so the two cannot drift: a
+    // mirror that accepts blocks while the server rejects them is worse than
+    // no test at all.
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const decl = src.match(/const EditMessageInput = z[\s\S]*?\.strict\(\)/)?.[0] ?? ''
+    expect(decl).not.toBe('')
+    expect(decl).toContain('blocks: z.array(z.record(z.string(), z.unknown())).optional()')
+    // text stays required — it is the notification fallback.
+    expect(decl).toContain('text: z.string().min(1)')
+  })
+
+  test('a secret pasted into a block is caught once the blocks are serialized', () => {
+    // Proves the serialization step surfaces the value the guard matches on;
+    // assertNoSecretValues is the same primitive the reply path uses.
+    const secret = 'xoxb-planted-marker-value-1234567890'
+    const values = buildSecretValueSet((d) => (d.name === 'SLACK_BOT_TOKEN' ? secret : undefined))
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `token: ${secret}` } }]
+    expect(() => assertNoSecretValues(JSON.stringify(blocks), values)).toThrow()
+    // Control: the same guard passes on clean blocks.
+    const clean = [{ type: 'section', text: { type: 'mrkdwn', text: 'no secrets here' } }]
+    expect(() => assertNoSecretValues(JSON.stringify(clean), values)).not.toThrow()
   })
 })
 

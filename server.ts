@@ -34,6 +34,7 @@ import {
   assertManifestIdentityResolved,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
+  buildEditMessagePayload,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   chunkText,
@@ -901,6 +902,11 @@ const EditMessageInput = z
     message_id: z.string().min(1),
     text: z.string().min(1),
     thread_ts: z.string().optional(),
+    /** Slack Block Kit blocks for the edited message. Same shape as the
+     *  reply tool's `blocks`. When present, `text` stays on the update as
+     *  the notification fallback: chat.update REPLACES the message wholesale,
+     *  so a text-only update on a Block Kit message deletes its blocks. */
+    blocks: z.array(z.record(z.string(), z.unknown())).optional(),
   })
   .strict()
 
@@ -1016,13 +1022,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_message',
-      description: "Edit a previously sent message (bot's own messages only).",
+      description:
+        "Edit a previously sent message (bot's own messages only). Supports Block Kit rich layouts with live buttons.",
       inputSchema: {
         type: 'object' as const,
         properties: {
           chat_id: { type: 'string', description: 'Channel ID' },
           message_id: { type: 'string', description: 'Message timestamp (ts)' },
-          text: { type: 'string', description: 'New message text' },
+          text: {
+            type: 'string',
+            description:
+              'New message text (mrkdwn supported). When blocks is also set, text is the notification fallback only.',
+          },
+          blocks: {
+            type: 'array',
+            items: { type: 'object' },
+            description:
+              'Slack Block Kit blocks for the edited message (optional). Slack replaces the message wholesale on edit, so a message that was sent WITH blocks must be edited WITH blocks — editing it with text alone deletes its layout and buttons. Pass the full desired block list, not a delta. Buttons stay LIVE after the edit; give each a distinct action_id (any string not starting with "perm:") and a value.',
+          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -1754,6 +1771,28 @@ async function executeEditMessage(
   // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
   // gate.outbound.allow event (a blocked edit was never allowed).
   guardOutboundSecretValues(args.text, 'edit_message', ctx)
+  const blocks: unknown[] | undefined = args.blocks
+  if (blocks !== undefined) {
+    // Same two guards the reply path runs over Block Kit content. Without
+    // them the edit path is a bypass: identical payload, no checks.
+    guardOutboundSecretValues(JSON.stringify(blocks), 'edit_message', ctx)
+    // Reserved-namespace enforcement: a perm:-prefixed action_id would let a
+    // prompt-injected turn dress an agent-authored button up as a policy
+    // approval and convert the owner's click into a tool-call approval.
+    const reserved = findReservedActionId(blocks)
+    if (reserved !== null) {
+      ctx.journalWrite({
+        kind: 'gate.outbound.deny',
+        outcome: 'deny',
+        toolName: 'edit_message',
+        input: { channel: args.chat_id, thread_ts: args.thread_ts },
+        reason: `blocks action_id uses the reserved perm: namespace: ${reserved}`,
+      })
+      throw new Error(
+        `edit_message: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
+      )
+    }
+  }
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1762,11 +1801,14 @@ async function executeEditMessage(
       args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
     input: { channel: args.chat_id, thread_ts: args.thread_ts },
   })
-  await ctx.web.chat.update({
-    channel: args.chat_id,
-    ts: args.message_id,
-    text: args.text,
-  })
+  await ctx.web.chat.update(
+    buildEditMessagePayload({
+      chat_id: args.chat_id,
+      message_id: args.message_id,
+      text: args.text,
+      blocks,
+    }) as never,
+  )
   return {
     content: [{ type: 'text', text: `Edited message ${args.message_id}` }],
   }

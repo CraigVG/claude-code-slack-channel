@@ -2965,6 +2965,32 @@ export function createConsumedClickStore(max = 10_000): { consume(key: string): 
   }
 }
 
+/** Build the `chat.update` payload for an edit.
+ *
+ *  Slack replaces an edited message wholesale: a `chat.update` carrying only
+ *  `text` DELETES whatever blocks the message had. So a caller re-sending a
+ *  Block Kit message must pass its blocks on every edit, and `text` stays on
+ *  the payload as the notification fallback rather than being dropped.
+ *
+ *  `blocks` is omitted entirely (not set to undefined) when the caller has
+ *  none, keeping a text-only edit's payload identical to the pre-blocks shape.
+ *
+ *  Pure — the outbound gate and the secret / reserved-namespace guards run in
+ *  the server handler before this is called. */
+export function buildEditMessagePayload(args: {
+  chat_id: string
+  message_id: string
+  text: string
+  blocks?: unknown[]
+}): { channel: string; ts: string; text: string; blocks?: unknown[] } {
+  return {
+    channel: args.chat_id,
+    ts: args.message_id,
+    text: args.text,
+    ...(args.blocks !== undefined ? { blocks: args.blocks } : {}),
+  }
+}
+
 /** Replace the actions block containing the clicked button with a context
  *  block confirming the choice. Leaves every other block untouched, so a
  *  message with several sections keeps its content and only loses the
@@ -2977,24 +3003,40 @@ export function replaceClickedActionsBlock(
   userId: string,
 ): unknown[] {
   return blocks.map((b) => {
-    const block = b as { type?: string; elements?: Array<{ action_id?: string }> }
+    const block = b as {
+      type?: string
+      elements?: Array<{ action_id?: string }>
+      blocks?: unknown[]
+    }
     const isClickedActions =
       block?.type === 'actions' &&
       Array.isArray(block.elements) &&
       block.elements.some((e) => e?.action_id === actionId)
-    return isClickedActions
-      ? {
-          type: 'context',
-          elements: [
-            {
-              type: 'mrkdwn',
-              // The label was inert plain_text on its button, but a context
-              // element is live mrkdwn — escape it so a label like
-              // "<!channel>" cannot become a real @channel ping on the swap.
-              text: `:white_check_mark: *${escMrkdwn(label)}* — <@${userId}>`,
-            },
-          ],
-        }
-      : b
+    if (isClickedActions) {
+      return {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            // The label was inert plain_text on its button, but a context
+            // element is live mrkdwn — escape it so a label like
+            // "<!channel>" cannot become a real @channel ping on the swap.
+            text: `:white_check_mark: *${escMrkdwn(label)}* — <@${userId}>`,
+          },
+        ],
+      }
+    }
+    // Container blocks (Slack's `card`) carry their own nested `blocks` array.
+    // Recurse so a button inside one still gets the confirmation swap; without
+    // this a card-nested click reads as dead — it fires, but nothing visibly
+    // changes and the buttons stay live. Keyed on the nested array rather than
+    // on type === 'card' so future container blocks are covered too.
+    if (b !== null && typeof b === 'object' && Array.isArray(block.blocks)) {
+      return {
+        ...block,
+        blocks: replaceClickedActionsBlock(block.blocks, actionId, label, userId),
+      }
+    }
+    return b
   })
 }
