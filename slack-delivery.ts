@@ -128,6 +128,31 @@ export class DurableUnavailableError extends Error {
   }
 }
 
+/** Message fragment of the fenced-write rejection a lapsed lease heartbeat
+ *  raises from `SessionHandle.update` (supervisor.ts). */
+const LEASE_LAPSED_MESSAGE = 'write fenced — lease heartbeat lapsed'
+
+/** Run the pre-send obligation record. A fenced rejection because the lease
+ *  heartbeat lapsed (a reply that arrives more than the lease TTL after the
+ *  last renewal, e.g. after a long tool call) is raised by `update()` before
+ *  `fn` runs and before anything is persisted, and before any send. So nothing
+ *  was recorded and nothing was posted: rethrow it as `DurableUnavailableError`
+ *  and the caller makes its one best-effort direct send in the same tool call,
+ *  instead of failing the reply and leaving the agent to retry by hand (eight
+ *  recurrences in Sep 2026; the manual retry always landed through this same
+ *  fallback, because the quarantined key makes the next `activate()` reject).
+ *  Any other failure, a superseded token included, propagates unchanged. */
+async function recordBeforeSend(write: () => Promise<void>): Promise<void> {
+  try {
+    await write()
+  } catch (err) {
+    if (err instanceof Error && err.message.includes(LEASE_LAPSED_MESSAGE)) {
+      throw new DurableUnavailableError(`obligation not recorded, nothing posted: ${err.message}`)
+    }
+    throw err
+  }
+}
+
 /** One logical reply to deliver durably. `id` is the caller-supplied stable
  *  unique key (a fresh UUID per reply call) — it becomes the obligation id and
  *  thus the idempotency key, so a poller redelivery of THIS obligation dedups
@@ -193,13 +218,15 @@ export async function deliverReplyDurably(
   const token = lease.token
 
   // Record the durable obligation BEFORE the send (crash-before-send safe).
-  await handle.recordTerminalDelivery(token, {
-    id: reply.id,
-    channel: reply.channel,
-    thread: reply.thread,
-    payload: reply.text,
-    ...(reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
-  })
+  await recordBeforeSend(() =>
+    handle.recordTerminalDelivery(token, {
+      id: reply.id,
+      channel: reply.channel,
+      thread: reply.thread,
+      payload: reply.text,
+      ...(reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
+    }),
+  )
   const obligation: DeliveryObligation = {
     id: reply.id,
     channel: reply.channel,
@@ -303,7 +330,7 @@ export async function deliverChunkedReplyDurably(
   }))
 
   // Record ALL N before ANY send (crash-before-send safe, all-or-nothing).
-  await handle.recordTerminalDeliveries(token, records)
+  await recordBeforeSend(() => handle.recordTerminalDeliveries(token, records))
 
   let firstTs: string | undefined
   let delivered = 0
@@ -401,12 +428,14 @@ export async function beginDurableStream(
 
   // Record the full-text obligation BEFORE the stream starts (crash-before /
   // crash-during-stream safe).
-  await handle.recordTerminalDelivery(token, {
-    id: reply.id,
-    channel: reply.channel,
-    thread: reply.thread,
-    payload: reply.text,
-  })
+  await recordBeforeSend(() =>
+    handle.recordTerminalDelivery(token, {
+      id: reply.id,
+      channel: reply.channel,
+      thread: reply.thread,
+      payload: reply.text,
+    }),
+  )
 
   return {
     markDelivered(): Promise<void> {
@@ -549,7 +578,7 @@ export async function deliverFileReplyDurably(
     upload,
   }))
   const records = [...textRecords, ...fileRecords]
-  await handle.recordTerminalDeliveries(token, records)
+  await recordBeforeSend(() => handle.recordTerminalDeliveries(token, records))
 
   const total = records.length
   let firstTs: string | undefined
