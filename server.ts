@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
@@ -180,6 +181,7 @@ if (_verifyPath !== null) {
   }
 }
 
+import { releaseSocketLock, tryAcquireSocketLock } from './socket-lock.ts'
 import {
   createSessionSupervisor,
   resolveIdleMs,
@@ -198,6 +200,7 @@ const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const SOCKET_LOCK_FILE = join(STATE_DIR, 'socket.lock')
 const DEFAULT_CHUNK_LIMIT = 4000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
@@ -3893,6 +3896,7 @@ let journal: JournalWriter | null = null
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  releaseSocketLock(SOCKET_LOCK_FILE, process.pid)
   console.error(`[slack] Shutting down: ${reason}`)
 
   // Force-exit safety net: if socket/mcp close hangs, don't linger.
@@ -3967,10 +3971,29 @@ async function shutdown(reason: string, code = 0): Promise<void> {
 
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
+// Covers exits that bypass shutdown() (uncaught errors, process.exit elsewhere).
+process.on('exit', () => releaseSocketLock(SOCKET_LOCK_FILE, process.pid))
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
+
+/** True when `pid` is a live slack-channel server process. Checks the command
+ *  line too, so a lock left by a process that died before a reboot (its PID
+ *  now reused by something else) never blocks the socket. */
+function isSlackServerProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false
+  }
+  try {
+    const cmd = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8' })
+    return cmd.includes('server.ts')
+  } catch {
+    return false
+  }
+}
 
 async function main(): Promise<void> {
   // Open audit journal if --audit-log-file or SLACK_AUDIT_LOG is set.
@@ -4261,6 +4284,24 @@ async function main(): Promise<void> {
     // backoff schedule are pure functions in lib.ts (classifySocketStartError /
     // nextSocketStartBackoffMs) so the boot-path classification is unit-tested
     // without importing this module (ccsc-x0t.4 / ccsc-x0t.10).
+    // One Socket Mode connection per app token per host (socket-lock.ts).
+    // A later process with the same state dir keeps outbound tools but waits,
+    // retrying so it takes over if the holder exits.
+    let lockWarned = false
+    while (!shuttingDown) {
+      const lock = tryAcquireSocketLock(SOCKET_LOCK_FILE, process.pid, isSlackServerProcess)
+      if (lock.acquired) break
+      if (!lockWarned) {
+        console.error(
+          `[slack] pid ${lock.holder} already holds the Socket Mode connection for this app (${SOCKET_LOCK_FILE}); ` +
+            'inbound disabled in this process, outbound tools still work. Retrying every 30s.',
+        )
+        lockWarned = true
+      }
+      await new Promise((r) => setTimeout(r, 30_000))
+    }
+    if (shuttingDown) return
+
     const MAX_SOCKET_START_ATTEMPTS = 10
     let attempt = 0
     let delayMs = 2_000
