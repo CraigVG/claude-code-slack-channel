@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
@@ -44,6 +45,7 @@ import {
   decideInteractionRoute,
   decidePermissionRoute,
   defaultAccess,
+  deferredThreadChange,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
@@ -179,6 +181,7 @@ if (_verifyPath !== null) {
   }
 }
 
+import { releaseSocketLock, tryAcquireSocketLock } from './socket-lock.ts'
 import {
   createSessionSupervisor,
   resolveIdleMs,
@@ -197,6 +200,7 @@ const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const SOCKET_LOCK_FILE = join(STATE_DIR, 'socket.lock')
 const DEFAULT_CHUNK_LIMIT = 4000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
@@ -641,6 +645,21 @@ const MAX_ENGAGED_THREADS = 10_000
 /** Record a thread as engaged for mention-stickiness, bounding the cache.
  *  Sets iterate in insertion order, so the first key is the oldest; evict it
  *  when at capacity (only when adding a genuinely new key). */
+// Threads handed to a deferTo sibling bot ("latest mention owns the thread").
+// Same bound and eviction as engagedThreads. Session-lifetime cache.
+const deferredThreads = new Set<string>()
+function applyDeferredThreadChange(change: { add?: string; remove?: string } | null): void {
+  if (!change) return
+  if (change.remove) deferredThreads.delete(change.remove)
+  if (change.add) {
+    if (deferredThreads.size >= MAX_ENGAGED_THREADS && !deferredThreads.has(change.add)) {
+      const oldest = deferredThreads.values().next().value
+      if (oldest !== undefined) deferredThreads.delete(oldest)
+    }
+    deferredThreads.add(change.add)
+  }
+}
+
 function recordEngagedThread(key: string): void {
   if (engagedThreads.size >= MAX_ENGAGED_THREADS && !engagedThreads.has(key)) {
     const oldest = engagedThreads.values().next().value
@@ -794,6 +813,7 @@ async function gate(event: unknown): Promise<GateResult> {
     // ccsc-apj.1 — engaged-thread set so a human can keep talking in a
     // thread they already mentioned the bot in, without re-mentioning.
     engagedThreads,
+    deferredThreads,
   })
 }
 
@@ -3192,7 +3212,9 @@ async function deliverButtonClick(
   // design call 1): on a requireMention channel a click only delivers when
   // the thread was ALREADY engaged by a human mention, so a click can never
   // open a thread for mention-free follow-ups; this call is then a no-op
-  // refresh. Dropped clicks never reach here.
+  // refresh. Exception: with ownThreadsEngaged every click on this bot's own
+  // buttons delivers, and this call does open the thread. Dropped clicks
+  // never reach here.
   recordEngagedThread(libDeliveredThreadKey(channelId, threadTs ?? messageTs))
 
   // Same session accounting as a delivered message (#270 review, design call
@@ -3596,6 +3618,9 @@ async function handleMessage(event: unknown): Promise<void> {
   if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) return
 
   const result = await gate(event)
+  if (result.action === 'deliver' || result.dropReason === 'channel.deferred') {
+    applyDeferredThreadChange(deferredThreadChange(ev, getAccess(), botUserId))
+  }
   switch (result.action) {
     case 'drop': {
       journalWrite({
@@ -3871,6 +3896,7 @@ let journal: JournalWriter | null = null
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  releaseSocketLock(SOCKET_LOCK_FILE, process.pid)
   console.error(`[slack] Shutting down: ${reason}`)
 
   // Force-exit safety net: if socket/mcp close hangs, don't linger.
@@ -3945,10 +3971,29 @@ async function shutdown(reason: string, code = 0): Promise<void> {
 
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
+// Covers exits that bypass shutdown() (uncaught errors, process.exit elsewhere).
+process.on('exit', () => releaseSocketLock(SOCKET_LOCK_FILE, process.pid))
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
+
+/** True when `pid` is a live slack-channel server process. Checks the command
+ *  line too, so a lock left by a process that died before a reboot (its PID
+ *  now reused by something else) never blocks the socket. */
+function isSlackServerProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false
+  }
+  try {
+    const cmd = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8' })
+    return cmd.includes('server.ts')
+  } catch {
+    return false
+  }
+}
 
 async function main(): Promise<void> {
   // Open audit journal if --audit-log-file or SLACK_AUDIT_LOG is set.
@@ -4239,6 +4284,24 @@ async function main(): Promise<void> {
     // backoff schedule are pure functions in lib.ts (classifySocketStartError /
     // nextSocketStartBackoffMs) so the boot-path classification is unit-tested
     // without importing this module (ccsc-x0t.4 / ccsc-x0t.10).
+    // One Socket Mode connection per app token per host (socket-lock.ts).
+    // A later process with the same state dir keeps outbound tools but waits,
+    // retrying so it takes over if the holder exits.
+    let lockWarned = false
+    while (!shuttingDown) {
+      const lock = tryAcquireSocketLock(SOCKET_LOCK_FILE, process.pid, isSlackServerProcess)
+      if (lock.acquired) break
+      if (!lockWarned) {
+        console.error(
+          `[slack] pid ${lock.holder} already holds the Socket Mode connection for this app (${SOCKET_LOCK_FILE}); ` +
+            'inbound disabled in this process, outbound tools still work. Retrying every 30s.',
+        )
+        lockWarned = true
+      }
+      await new Promise((r) => setTimeout(r, 30_000))
+    }
+    if (shuttingDown) return
+
     const MAX_SOCKET_START_ATTEMPTS = 10
     let attempt = 0
     let delayMs = 2_000

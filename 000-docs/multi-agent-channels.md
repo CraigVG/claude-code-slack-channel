@@ -197,6 +197,10 @@ Use `bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log`
 to confirm chain integrity. After PR #177 (`ccsc-22l`), entries are
 Ed25519-signed under each operator's audit key.
 
+## Splitting one channel between two agents
+
+When two agents should not both answer the same human messages (one answers only `@`-mentions, the other takes the rest), use `ownThreadsEngaged` and `deferTo` instead of relying on `allowBotIds` alone. Recipe and semantics: ACCESS.md, "Two agents sharing one channel".
+
 ## Common failure modes
 
 | Symptom | Cause | Fix |
