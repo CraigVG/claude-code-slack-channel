@@ -490,6 +490,14 @@ rule.
 - **Ephemeral-button clicks** (no `body.message`) have no thread
   identity: no session key, no supervisor activation, and fail-closed
   under `requireMention`.
+- **Exception, `ownThreadsEngaged` (2026-10-08).** A channel that sets
+  `ownThreadsEngaged` opts out of the strict click rule above: every
+  click is delivered, because Slack routes `block_actions` only to the
+  app that posted the buttons, so the click is on this bot's own
+  message. Such a click therefore can open a thread for mention-free
+  follow-ups. Ephemeral clicks (no thread identity) still fail closed.
+  Channels without the flag keep `ccsc-83u` unchanged. See ACCESS.md
+  "Two agents sharing one channel".
 - **Delivery is awaited.** The confirmation swap (buttons → ✅ context
   line) paints only after the MCP notification succeeds; on transport
   failure the buttons stay visually intact and the consumed-once record

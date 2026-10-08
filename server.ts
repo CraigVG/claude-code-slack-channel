@@ -44,6 +44,7 @@ import {
   decideInteractionRoute,
   decidePermissionRoute,
   defaultAccess,
+  deferredThreadChange,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
@@ -641,6 +642,21 @@ const MAX_ENGAGED_THREADS = 10_000
 /** Record a thread as engaged for mention-stickiness, bounding the cache.
  *  Sets iterate in insertion order, so the first key is the oldest; evict it
  *  when at capacity (only when adding a genuinely new key). */
+// Threads handed to a deferTo sibling bot ("latest mention owns the thread").
+// Same bound and eviction as engagedThreads. Session-lifetime cache.
+const deferredThreads = new Set<string>()
+function applyDeferredThreadChange(change: { add?: string; remove?: string } | null): void {
+  if (!change) return
+  if (change.remove) deferredThreads.delete(change.remove)
+  if (change.add) {
+    if (deferredThreads.size >= MAX_ENGAGED_THREADS && !deferredThreads.has(change.add)) {
+      const oldest = deferredThreads.values().next().value
+      if (oldest !== undefined) deferredThreads.delete(oldest)
+    }
+    deferredThreads.add(change.add)
+  }
+}
+
 function recordEngagedThread(key: string): void {
   if (engagedThreads.size >= MAX_ENGAGED_THREADS && !engagedThreads.has(key)) {
     const oldest = engagedThreads.values().next().value
@@ -794,6 +810,7 @@ async function gate(event: unknown): Promise<GateResult> {
     // ccsc-apj.1 — engaged-thread set so a human can keep talking in a
     // thread they already mentioned the bot in, without re-mentioning.
     engagedThreads,
+    deferredThreads,
   })
 }
 
@@ -3192,7 +3209,9 @@ async function deliverButtonClick(
   // design call 1): on a requireMention channel a click only delivers when
   // the thread was ALREADY engaged by a human mention, so a click can never
   // open a thread for mention-free follow-ups; this call is then a no-op
-  // refresh. Dropped clicks never reach here.
+  // refresh. Exception: with ownThreadsEngaged every click on this bot's own
+  // buttons delivers, and this call does open the thread. Dropped clicks
+  // never reach here.
   recordEngagedThread(libDeliveredThreadKey(channelId, threadTs ?? messageTs))
 
   // Same session accounting as a delivered message (#270 review, design call
@@ -3596,6 +3615,9 @@ async function handleMessage(event: unknown): Promise<void> {
   if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) return
 
   const result = await gate(event)
+  if (result.action === 'deliver' || result.dropReason === 'channel.deferred') {
+    applyDeferredThreadChange(deferredThreadChange(ev, getAccess(), botUserId))
+  }
   switch (result.action) {
     case 'drop': {
       journalWrite({

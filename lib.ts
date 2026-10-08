@@ -1893,6 +1893,11 @@ export interface GateOptions {
    *  the backstop). Absent (tests / no wiring) → no thread is engaged, so
    *  `requireMention` behaves exactly as before. */
   engagedThreads?: ReadonlySet<string>
+  /** Threads this session has handed to a `deferTo` bot because the latest
+   *  mention there was of that bot (see `deferredThreadChange`). Keyed like
+   *  `engagedThreads` (`thread_ts ?? ts`). Absent → only the mention and
+   *  parent-thread rules of `deferTo` apply. */
+  deferredThreads?: ReadonlySet<string>
 }
 
 /**
@@ -2046,12 +2051,24 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
 
-  // deferTo: leave messages addressed to a sibling agent to that agent. A
-  // mention of this bot always wins; peer bots are handled by allowBotIds.
+  // deferTo: two agents share this channel, and the LATEST mention owns a
+  // thread. An unmentioned human message is left to the sibling when it
+  // mentions the sibling, when its thread is in deferredThreads (the sibling
+  // was mentioned there after us), or when the sibling started the thread and
+  // we were never mentioned in it. A mention of this bot always wins. Peer
+  // bots are handled by allowBotIds, not here.
   if (!ev.bot_id && policy.deferTo?.length && !isMentioned(ev, botUserId)) {
+    const key = deliveredThreadKey(
+      channel,
+      (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined),
+    )
     const parent = ev.parent_user_id as string | undefined
-    const inDeferredThread = !!ev.thread_ts && !!parent && policy.deferTo.includes(parent)
-    if (inDeferredThread || policy.deferTo.some((id) => isMentioned(ev, id))) {
+    const siblingThread = !!ev.thread_ts && !!parent && policy.deferTo.includes(parent)
+    if (
+      policy.deferTo.some((id) => isMentioned(ev, id)) ||
+      opts.deferredThreads?.has(key) ||
+      (siblingThread && !opts.engagedThreads?.has(key))
+    ) {
       return { action: 'drop', dropReason: 'channel.deferred' }
     }
   }
@@ -2086,6 +2103,31 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   }
 
   return { action: 'deliver', access }
+}
+
+/** How a human channel message changes this session's `deferredThreads`
+ *  ("latest mention owns the thread", for channels with `deferTo`). Pure; the
+ *  caller applies it for events that passed the channel and allowFrom checks
+ *  (delivered, or dropped as `channel.deferred`).
+ *  - mentions this bot → `remove` the thread (we take it back);
+ *  - mentions a `deferTo` bot and not this one → `add` the thread.
+ *  Returns null when nothing changes. */
+export function deferredThreadChange(
+  ev: Record<string, unknown>,
+  access: Access,
+  botUserId: string,
+): { add?: string; remove?: string } | null {
+  if (ev.bot_id || ev.channel_type === 'im') return null
+  const channel = ev.channel as string
+  const policy = getChannelPolicy(access, channel)
+  if (!policy?.deferTo?.length) return null
+  const key = deliveredThreadKey(
+    channel,
+    (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined),
+  )
+  if (botUserId && isMentioned(ev, botUserId)) return { remove: key }
+  if (policy.deferTo.some((id) => isMentioned(ev, id))) return { add: key }
+  return null
 }
 
 export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
@@ -2880,7 +2922,9 @@ export type InteractionRoute = { action: 'deliver' } | { action: 'drop'; dropRea
  *  000-docs/session-state-machine.md § "Interactive inbound: button clicks"):
  *
  *  - `requireMention` channels deliver a click only when its thread is already
- *    engaged (a human previously mentioned the bot there) — exactly the
+ *    engaged (a human previously mentioned the bot there), unless the channel
+ *    sets `ownThreadsEngaged` (then every click with a thread identity
+ *    delivers: Slack routes clicks only to the app that posted the buttons) — exactly the
  *    mention-stickiness rule a mention-less *message* gets. A click cannot
  *    carry a mention, so it can never OPEN a thread; on an unengaged thread it
  *    drops as `channel.require_mention`. This closes the quiet path where an
@@ -2922,8 +2966,16 @@ export function decideInteractionRoute(
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(interaction.userId)) {
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
-  // ownThreadsEngaged: every click this app receives is on its own message.
-  if (policy.requireMention && !policy.ownThreadsEngaged) {
+  // ownThreadsEngaged: every click this app receives is on its own message
+  // (Slack routes block_actions only to the posting app). An ephemeral-button
+  // click carries no thread identity and still fails closed.
+  if (policy.requireMention && policy.ownThreadsEngaged) {
+    if (!(interaction.threadTs ?? interaction.messageTs)) {
+      return { action: 'drop', dropReason: 'channel.require_mention' }
+    }
+    return { action: 'deliver' }
+  }
+  if (policy.requireMention) {
     // Thread key mirrors the message gate: thread_ts ?? message ts. An
     // ephemeral-button click has neither → key never matches → fail closed.
     const threadKey = deliveredThreadKey(
