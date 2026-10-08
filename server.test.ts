@@ -20283,8 +20283,17 @@ describe('shared channel — two-session matrix (latest mention owns the thread)
     expect((await send(S, 'thx', t)).handled).toEqual(['dev'])
   })
 
-  test('a message mentioning both bots reaches both (accepted)', async () => {
+  test('a message mentioning both bots reaches both; its follow-ups go to the Queen', async () => {
     const S = mk()
-    expect((await send(S, '<@U_QUEEN> <@U_DEV> sync up')).handled).toEqual(['queen', 'dev'])
+    const open = await send(S, '<@U_QUEEN> <@U_DEV> sync up')
+    expect(open.handled).toEqual(['queen', 'dev'])
+    expect((await send(S, 'ok so what next', { ts: open.ts, parent: 'U_CRAIG' })).handled).toEqual([
+      'queen',
+    ])
+    expect(
+      (await send(S, '<@U_DEV> you take the code part', { ts: open.ts, parent: 'U_CRAIG' }))
+        .handled,
+    ).toEqual(['dev'])
+    expect((await send(S, 'done?', { ts: open.ts, parent: 'U_CRAIG' })).handled).toEqual(['dev'])
   })
 })

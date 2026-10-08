@@ -103,7 +103,10 @@ Two sessions can split one channel, each through its own Slack app: one hears on
 - **The latest mention owns a thread.** Each session keeps a session-lifetime set of threads it has handed over: a human mention of a sibling (and not of this bot) adds the thread, a mention of this bot removes it. Unmentioned replies follow the most recently mentioned bot.
 - **Threads a bot started** go to that bot (`ownThreadsEngaged` for the coordinator; the `parent_user_id` rule of `deferTo` for the worker) until a human mentions the other bot there.
 - **Clicks.** Slack sends `block_actions` only to the app that posted the buttons, so with `ownThreadsEngaged` every click is on this bot's own message and is delivered (channel `allowFrom` still applies; ephemeral-button clicks with no thread identity still fail closed).
-- **Accepted overlaps and gaps.** A message that mentions both bots reaches both. Thread replies sent with "Also send to channel" (`thread_broadcast`) are dropped by both, as before. Both caches are in memory, so after a restart a thread falls back to the parent/mention rules.
+- **Accepted overlaps and gaps.** A message that mentions both bots reaches both; its unmentioned follow-ups go to the mention-only side. Thread replies sent with "Also send to channel" (`thread_broadcast`) are dropped by both, as before. A bot mentioning the other bot does not move a thread; only human mentions do.
+- **Restarts.** Both caches are in memory and not shared, so after either session restarts a thread can reach both sessions or neither until someone mentions the intended bot in it once. That mention resyncs the thread.
+- **Keep `allowFrom` identical** on both sides for the shared channel, or the two sessions see different messages and their thread state drifts.
+- **Admin verbs** (`adminCommands`) return before thread engagement is recorded; do not enable them on a split channel.
 
 ### Multi-agent coordination (`allowBotIds`)
 

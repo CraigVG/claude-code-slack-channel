@@ -2109,7 +2109,9 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
  *  ("latest mention owns the thread", for channels with `deferTo`). Pure; the
  *  caller applies it for events that passed the channel and allowFrom checks
  *  (delivered, or dropped as `channel.deferred`).
- *  - mentions this bot → `remove` the thread (we take it back);
+ *  - mentions this bot → `remove` the thread (we take it back), except when it
+ *    also mentions a `deferTo` bot on an ambient channel: then `add` (the
+ *    mention-only side owns threads where both bots were mentioned);
  *  - mentions a `deferTo` bot and not this one → `add` the thread.
  *  Returns null when nothing changes. */
 export function deferredThreadChange(
@@ -2125,8 +2127,15 @@ export function deferredThreadChange(
     channel,
     (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined),
   )
-  if (botUserId && isMentioned(ev, botUserId)) return { remove: key }
-  if (policy.deferTo.some((id) => isMentioned(ev, id))) return { add: key }
+  const mentionsSibling = policy.deferTo.some((id) => isMentioned(ev, id))
+  if (botUserId && isMentioned(ev, botUserId)) {
+    // Both bots mentioned: the message reaches both, but the follow-ups need
+    // one owner. The mention-only (coordinator) side keeps the thread; the
+    // ambient side hands it over.
+    if (mentionsSibling && !policy.requireMention) return { add: key }
+    return { remove: key }
+  }
+  if (mentionsSibling) return { add: key }
   return null
 }
 
