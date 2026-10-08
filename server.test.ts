@@ -19909,3 +19909,170 @@ describe('button-relay hardening details', () => {
     expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_blocks_format')).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Two agents sharing one channel (2026-10-08): ownThreadsEngaged + deferTo.
+// The Queen runs C_SHARED as requireMention + ownThreadsEngaged; the dev agent
+// runs it ambient with deferTo: [U_QUEEN].
+// ---------------------------------------------------------------------------
+describe('shared channel — ownThreadsEngaged', () => {
+  const policy = { requireMention: true, allowFrom: [], ownThreadsEngaged: true }
+  const reply = (over: Record<string, unknown> = {}) => ({
+    user: 'U123',
+    channel: 'C_SHARED',
+    channel_type: 'channel',
+    text: 'approved, ship it',
+    thread_ts: 'T1',
+    ts: 'T2',
+    ...over,
+  })
+
+  test('delivers an un-mentioned human reply in a thread this bot started', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(
+      reply({ parent_user_id: 'U_BOT' }),
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('drops an un-mentioned reply in a thread someone else started', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(
+      reply({ parent_user_id: 'U_OTHER' }),
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result).toEqual({ action: 'drop', dropReason: 'channel.require_mention' })
+  })
+
+  test('drops an un-mentioned top-level message (no thread)', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(
+      { user: 'U123', channel: 'C_SHARED', channel_type: 'channel', text: 'hello', ts: 'T5' },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result).toEqual({ action: 'drop', dropReason: 'channel.require_mention' })
+  })
+
+  test("without ownThreadsEngaged, a reply in this bot's thread still needs a mention (unchanged)", async () => {
+    const access = makeAccess({ channels: { C_SHARED: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      reply({ parent_user_id: 'U_BOT' }),
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result).toEqual({ action: 'drop', dropReason: 'channel.require_mention' })
+  })
+
+  test("does not deliver an un-mentioned PEER BOT reply in this bot's thread", async () => {
+    const access = makeAccess({
+      channels: { C_SHARED: { ...policy, allowBotIds: ['U_PEER'] } },
+    })
+    const result = await gate(
+      reply({ user: 'U_PEER', bot_id: 'B_PEER', parent_user_id: 'U_BOT' }),
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('does not engage when botUserId is not yet resolved', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(
+      reply({ parent_user_id: '' }),
+      makeOpts({ access, botUserId: '', engagedThreads: new Set() }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('click on a requireMention + ownThreadsEngaged channel delivers without prior engagement', () => {
+    const a = makeAccess({ channels: { C_SHARED: policy } })
+    const click = {
+      actionType: 'button',
+      userId: 'U123',
+      channelId: 'C_SHARED',
+      actionTs: '1.2',
+      messageTs: '9.9',
+    }
+    expect(decideInteractionRoute(click, a, new Set())).toEqual({ action: 'deliver' })
+  })
+
+  test('click still honors the channel allowFrom with ownThreadsEngaged', () => {
+    const a = makeAccess({ channels: { C_SHARED: { ...policy, allowFrom: ['U_OK'] } } })
+    const click = {
+      actionType: 'button',
+      userId: 'U123',
+      channelId: 'C_SHARED',
+      actionTs: '1.2',
+      messageTs: '9.9',
+    }
+    expect(decideInteractionRoute(click, a, new Set())).toEqual({
+      action: 'drop',
+      dropReason: 'channel.allowfrom_miss',
+    })
+  })
+})
+
+describe('shared channel — deferTo', () => {
+  const policy = { requireMention: false, allowFrom: [], deferTo: ['U_QUEEN'] }
+  const msg = (over: Record<string, unknown> = {}) => ({
+    user: 'U123',
+    channel: 'C_SHARED',
+    channel_type: 'channel',
+    text: 'can you look at the failing build',
+    ts: 'T2',
+    ...over,
+  })
+  const opts = (access: ReturnType<typeof makeAccess>) => makeOpts({ access, botUserId: 'U_DEV' })
+
+  test('delivers an ordinary human message (ambient channel unchanged)', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    expect((await gate(msg(), opts(access))).action).toBe('deliver')
+  })
+
+  test('drops a reply in a thread the deferred bot started', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(msg({ thread_ts: 'T1', parent_user_id: 'U_QUEEN' }), opts(access))
+    expect(result).toEqual({ action: 'drop', dropReason: 'channel.deferred' })
+  })
+
+  test('drops a top-level message that mentions only the deferred bot', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(msg({ text: '<@U_QUEEN> promote train 218' }), opts(access))
+    expect(result).toEqual({ action: 'drop', dropReason: 'channel.deferred' })
+  })
+
+  test('a mention of this bot wins over deferTo (both mentioned)', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(msg({ text: '<@U_QUEEN> <@U_DEV> pair on this' }), opts(access))
+    expect(result.action).toBe('deliver')
+  })
+
+  test("a mention of this bot wins inside the deferred bot's thread", async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(
+      msg({ text: '<@U_DEV> can you take this one', thread_ts: 'T1', parent_user_id: 'U_QUEEN' }),
+      opts(access),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('a deferred-bot mention inside a code block does not defer', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const blocks = [
+      {
+        type: 'rich_text',
+        elements: [
+          { type: 'rich_text_section', elements: [{ type: 'text', text: 'the card said ' }] },
+          { type: 'rich_text_preformatted', elements: [{ type: 'user', user_id: 'U_QUEEN' }] },
+        ],
+      },
+    ]
+    const result = await gate(msg({ text: 'the card said <@U_QUEEN>', blocks }), opts(access))
+    expect(result.action).toBe('deliver')
+  })
+
+  test('a reply in a thread a non-deferred bot started is delivered', async () => {
+    const access = makeAccess({ channels: { C_SHARED: policy } })
+    const result = await gate(msg({ thread_ts: 'T1', parent_user_id: 'U_SOMEONE' }), opts(access))
+    expect(result.action).toBe('deliver')
+  })
+})

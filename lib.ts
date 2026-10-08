@@ -94,6 +94,19 @@ export interface ChannelPolicy {
    *  not share context/ownership. Absent or false → one shared session per
    *  (channel, thread) (the default; behavior unchanged). */
   perUserSessions?: boolean
+  /** On a `requireMention` channel, treat threads THIS bot started as engaged
+   *  (two agents sharing one channel, 2026-10-08): a human reply whose
+   *  `parent_user_id` is this bot, and a click on one of this bot's buttons,
+   *  deliver without a fresh mention. Slack routes `block_actions` only to
+   *  the app that posted the buttons, so every click this app receives is on
+   *  its own message. Absent or false → unchanged mention-stickiness rule. */
+  ownThreadsEngaged?: boolean
+  /** Bot user IDs this session yields to in this channel (two agents sharing
+   *  one channel, 2026-10-08). A HUMAN message that does not mention this bot
+   *  is dropped as `channel.deferred` when it mentions one of these bots, or
+   *  when it is a thread reply whose `parent_user_id` is one of them. A
+   *  mention of this bot always wins. Absent or empty → unchanged. */
+  deferTo?: string[]
 }
 
 export interface PendingEntry {
@@ -171,6 +184,7 @@ export type GateDropReason =
   | 'channel.not_opted' // channel not opted in (no ChannelPolicy)
   | 'channel.allowfrom_miss' // sender not in the channel's allowFrom
   | 'channel.require_mention' // requireMention channel, no mention, thread not engaged (ccsc-apj.1)
+  | 'channel.deferred' // human message addressed to a bot listed in the channel's deferTo
 
 export interface GateResult {
   action: GateAction
@@ -2032,7 +2046,27 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
 
+  // deferTo: leave messages addressed to a sibling agent to that agent. A
+  // mention of this bot always wins; peer bots are handled by allowBotIds.
+  if (!ev.bot_id && policy.deferTo?.length && !isMentioned(ev, botUserId)) {
+    const parent = ev.parent_user_id as string | undefined
+    const inDeferredThread = !!ev.thread_ts && !!parent && policy.deferTo.includes(parent)
+    if (inDeferredThread || policy.deferTo.some((id) => isMentioned(ev, id))) {
+      return { action: 'drop', dropReason: 'channel.deferred' }
+    }
+  }
+
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
+    // ownThreadsEngaged: a human reply in a thread this bot started.
+    if (
+      !ev.bot_id &&
+      policy.ownThreadsEngaged &&
+      botUserId &&
+      ev.thread_ts &&
+      ev.parent_user_id === botUserId
+    ) {
+      return { action: 'deliver', access }
+    }
     // ccsc-apj.1 — thread-sticky engagement. Once a HUMAN has engaged a
     // thread by mentioning the bot, subsequent human messages in that same
     // thread are delivered without a fresh mention ("mention once, then
@@ -2888,7 +2922,8 @@ export function decideInteractionRoute(
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(interaction.userId)) {
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
-  if (policy.requireMention) {
+  // ownThreadsEngaged: every click this app receives is on its own message.
+  if (policy.requireMention && !policy.ownThreadsEngaged) {
     // Thread key mirrors the message gate: thread_ts ?? message ts. An
     // ephemeral-button click has neither → key never matches → fail closed.
     const threadKey = deliveredThreadKey(
