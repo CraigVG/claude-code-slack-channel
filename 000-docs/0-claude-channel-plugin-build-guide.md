@@ -109,6 +109,11 @@ Tells Claude Code how to spawn the MCP server subprocess.
 
 ### 3. `package.json` — Dependencies and Metadata
 
+The example below illustrates the upstream naming convention. This repository
+uses `claude-code-slack-channel` to match its GitHub identity, with an explicit
+`bin` map retaining `claude-channel-slack` as a compatibility alias. The Claude
+plugin name remains `slack-channel`.
+
 ```json
 {
   "name": "claude-channel-slack",
@@ -428,9 +433,10 @@ Five defense layers required for chat channel plugins:
 
 ## Research Preview Constraints
 
-- Channels require Claude Code v2.1.80+
-- Requires claude.ai login (no API key auth)
+- Channels require a current Claude Code build with Channels support
+- Authentication may use a claude.ai account or an Anthropic Console API key
 - Team/Enterprise orgs must enable `channelsEnabled` in managed settings
+- Channels are unavailable through Bedrock, Google Cloud Agent Platform, and Microsoft Foundry
 - `--channels` only accepts plugins from Anthropic's allowlist
 - Custom channels use `--dangerously-load-development-channels` for testing
 - Protocol contract may change during preview

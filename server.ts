@@ -51,6 +51,7 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
+  FetchMessagesInput,
   findReservedActionId,
   formatVerifyResult,
   type GateResult,
@@ -882,7 +883,8 @@ const mcp = new Server(
 // Tools — definition
 // ---------------------------------------------------------------------------
 
-// Per-tool Zod input schemas. Co-located with the tools list so the
+// Per-tool Zod input schemas (FetchMessagesInput is shared from lib.ts).
+// The remaining schemas are co-located with the tools list so the
 // JSON Schema (what the MCP client sees) and the runtime validator
 // stay visibly in sync. `.strict()` rejects unknown keys so a malformed
 // or crafted tool call cannot smuggle in extra fields. Each schema
@@ -928,14 +930,6 @@ const EditMessageInput = z
      *  the notification fallback: chat.update REPLACES the message wholesale,
      *  so a text-only update on a Block Kit message deletes its blocks. */
     blocks: z.array(z.record(z.string(), z.unknown())).optional(),
-  })
-  .strict()
-
-const FetchMessagesInput = z
-  .object({
-    channel: z.string().min(1),
-    limit: z.number().int().positive().optional(),
-    thread_ts: z.string().optional(),
   })
   .strict()
 

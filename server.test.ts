@@ -49,6 +49,7 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
+  FetchMessagesInput,
   findReservedActionId,
   findSecretDeclaration,
   type GateOptions,
@@ -2010,8 +2011,21 @@ describe('sanitizeFilename', () => {
 // ---------------------------------------------------------------------------
 
 describe('sanitizeDisplayName', () => {
-  test('strips control characters', () => {
-    expect(sanitizeDisplayName('alice\u0000\u001fbob')).toBe('alicebob')
+  const controlCodePoints = [
+    ...Array.from({ length: 32 }, (_, index) => index),
+    ...Array.from({ length: 33 }, (_, index) => 0x7f + index),
+  ]
+
+  test.each(controlCodePoints)('strips control code point %i from names', (codePoint) => {
+    expect(sanitizeDisplayName(`alice${String.fromCodePoint(codePoint)}bob`)).toBe('alicebob')
+  })
+
+  test('returns "unknown" for a name containing only C0, DEL, and C1 controls', () => {
+    expect(sanitizeDisplayName(String.fromCodePoint(...controlCodePoints))).toBe('unknown')
+  })
+
+  test('preserves ordinary Unicode names and the printable character after C1', () => {
+    expect(sanitizeDisplayName('¡Zoë 李明 👩🏽‍💻')).toBe('¡Zoë 李明 👩🏽‍💻')
   })
 
   test('strips newlines and tabs', () => {
@@ -9490,37 +9504,47 @@ describe('JournalWriter', () => {
   })
 
   test('reopen recovers correctly when the last line straddles 64 KiB chunk boundaries', async () => {
-    // Write a chain whose body is large enough that the tail scan has to
-    // pull multiple 64 KiB chunks to find the boundary newline. We do
-    // this by writing many events until the file is comfortably over
-    // 192 KiB (three chunks). Exercises the loop in readLastLine.
+    // The adjacent 80 KiB test covers a final line that needs two reverse
+    // chunks. This fixture deliberately needs at least three: the final
+    // line itself is larger than two 64 KiB chunks, so readLastLine must
+    // cross multiple chunk boundaries before it can find the preceding
+    // newline. Keep the fixture bounded at two production writes (and two
+    // fsyncs); the old 1,000-event loop made this test hit Bun's 5 s limit.
     const { JournalWriter } = await import('./journal.ts')
     const w1 = await JournalWriter.open({
       path: logPath,
       initialPrevHash: stableAnchor,
       now: () => fixedNow,
     })
+    const chunkSize = 64 * 1024
+    const multiChunkCorrelationId = 'x'.repeat(2 * chunkSize)
+    let firstWritten!: Awaited<ReturnType<typeof w1.writeEvent>>
     let lastWritten!: Awaited<ReturnType<typeof w1.writeEvent>>
     try {
-      // Each session.activate event is ~250-350 bytes framed. 1,000
-      // events ⇒ ~300 KiB file, well past a single 64 KiB chunk.
-      for (let i = 0; i < 1_000; i++) {
-        lastWritten = await w1.writeEvent({
-          kind: 'session.activate',
-          correlationId: `chunk-straddle-${i.toString().padStart(6, '0')}`,
-        })
-      }
+      firstWritten = await w1.writeEvent({
+        kind: 'session.activate',
+        correlationId: 'chunk-straddle-prefix',
+      })
+      lastWritten = await w1.writeEvent({
+        kind: 'session.activate',
+        correlationId: multiChunkCorrelationId,
+      })
     } finally {
       await w1.close()
     }
-    expect(lastWritten.seq).toBe(1_000)
+    expect(lastWritten.seq).toBe(2)
+    expect(Buffer.byteLength(JSON.stringify(lastWritten))).toBeGreaterThan(2 * chunkSize)
 
     // Reopen and verify the recovered head is the last-written event,
     // not something the tail scanner misattributed from an earlier chunk.
     const w2 = await JournalWriter.open({ path: logPath })
     try {
       expect(w2.headHash).toBe(lastWritten.hash)
-      expect(w2.nextSequenceNumber).toBe(1_001)
+      expect(w2.nextSequenceNumber).toBe(lastWritten.seq + 1)
+      const recovered = await w2.writeEvent({ kind: 'session.quiesce' })
+      expect(recovered.prevHash).toBe(lastWritten.hash)
+      expect(recovered.seq).toBe(lastWritten.seq + 1)
+      expect(lastWritten.prevHash).toBe(firstWritten.hash)
     } finally {
       await w2.close()
     }
@@ -12965,7 +12989,8 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
 // malformed tool calls reach the handler body and e.g.
 // `assertOutboundAllowed(undefined, ...)` / the Slack API gets undefined.
 //
-// These schemas are mirrored from `toolSchemas` in server.ts. Importing
+// FetchMessagesInput is shared from lib.ts; the remaining schemas below are
+// mirrored from `toolSchemas` in server.ts. Importing
 // server.ts directly would execute its top-level bootstrap (token load,
 // STATE_DIR mkdir, process.exit(1) on missing .env), so we duplicate the
 // shapes here deliberately and unit-test them in isolation. If a schema
@@ -13000,14 +13025,6 @@ describe('MCP tool input schemas (S5)', () => {
       text: z.string().min(1),
       thread_ts: z.string().optional(),
       blocks: z.array(z.record(z.string(), z.unknown())).optional(),
-    })
-    .strict()
-
-  const FetchMessagesInput = z
-    .object({
-      channel: z.string().min(1),
-      limit: z.number().int().positive().optional(),
-      thread_ts: z.string().optional(),
     })
     .strict()
 
@@ -13268,6 +13285,12 @@ describe('MCP tool input schemas (S5)', () => {
   })
 
   describe('FetchMessagesInput', () => {
+    test('accepts a legacy integer limit beyond the safe-integer ceiling', () => {
+      const result = FetchMessagesInput.safeParse({ channel: 'C123', limit: 2 ** 53 })
+      expect(result.success).toBe(true)
+      if (result.success) expect(result.data.limit).toBe(2 ** 53)
+    })
+
     test('accepts channel-only input', () => {
       const result = FetchMessagesInput.safeParse({ channel: 'C123' })
       expect(result.success).toBe(true)
@@ -20379,5 +20402,121 @@ describe('H-20261119-055 — self-mentions keep the message shape', () => {
     // The old global strip deleted every self-mention (the bug).
     expect(body).not.toMatch(/<@\$\{botUserId\}>[^`]*`,\s*'g'\)/)
     expect(body).toContain('params: { content: text, meta }')
+  })
+})
+
+// H-20261119-057: the live Ada / Melissa split on #developer-chat, both
+// sessions fed the same event. Policies mirror the two access.json files
+// (2026-11-19): Ada (slack-dev) is ambient and defers to Melissa; Melissa
+// (slack) is requireMention + ownThreadsEngaged, defers to Ada, and admits
+// Ada's bot posts. Each delivered copy runs through normalizeSelfMentions
+// the way deliverEvent does, so the test pins routing AND delivered text.
+describe('H-20261119-057 — Ada/Melissa split: routing plus delivered text', () => {
+  const ADA = 'U0BNA0EUA78'
+  const MELISSA = 'U0B1QKDKJBS'
+  type Sess = {
+    name: string
+    bot: string
+    policy: Record<string, unknown>
+    engaged: Set<string>
+    deferred: Set<string>
+  }
+  const mk = (): Sess[] => [
+    {
+      name: 'ada',
+      bot: ADA,
+      policy: { requireMention: false, deferTo: [MELISSA], allowFrom: [] },
+      engaged: new Set(),
+      deferred: new Set(),
+    },
+    {
+      name: 'melissa',
+      bot: MELISSA,
+      policy: {
+        requireMention: true,
+        allowBotIds: [ADA],
+        ownThreadsEngaged: true,
+        deferTo: [ADA],
+        allowFrom: [],
+      },
+      engaged: new Set(),
+      deferred: new Set(),
+    },
+  ]
+  let n = 0
+  type Got = { text: string; mentionsYou: boolean }
+  const send = async (S: Sess[], text: string, thread?: { ts: string; parent: string }) => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    n++
+    const ts = `D${n}`
+    const ev: Record<string, unknown> = {
+      user: 'U_CRAIG',
+      channel: 'C07MCB57ARW',
+      channel_type: 'channel',
+      text,
+      ts,
+    }
+    if (thread) Object.assign(ev, { thread_ts: thread.ts, parent_user_id: thread.parent })
+    const got: Record<string, Got> = {}
+    for (const s of S) {
+      const access = makeAccess({ channels: { C07MCB57ARW: s.policy as never } })
+      const r = await gate(
+        ev,
+        makeOpts({
+          access,
+          botUserId: s.bot,
+          engagedThreads: s.engaged,
+          deferredThreads: s.deferred,
+        }),
+      )
+      if (r.action === 'deliver' || r.dropReason === 'channel.deferred') {
+        const c = deferredThreadChange(ev, access, s.bot)
+        if (c?.remove) s.deferred.delete(c.remove)
+        if (c?.add) s.deferred.add(c.add)
+      }
+      if (r.action === 'deliver') {
+        s.engaged.add(deliveredThreadKey('C07MCB57ARW', thread?.ts ?? ts))
+        got[s.name] = normalizeSelfMentions(text, s.bot)
+      }
+    }
+    return { ts, got }
+  }
+
+  test('the incident message reaches both, each sees @you for itself and the other id', async () => {
+    const S = mk()
+    const open = await send(S, `<@${ADA}> and <@${MELISSA}> please look into vercel board`)
+    expect(open.got).toEqual({
+      ada: { text: `and <@${MELISSA}> please look into vercel board`, mentionsYou: true },
+      melissa: { text: `<@${ADA}> and @you please look into vercel board`, mentionsYou: true },
+    })
+    // Routing unchanged: an unmentioned follow-up in a both-mentioned
+    // thread goes to the mention-only side (Melissa).
+    const t = { ts: open.ts, parent: 'U_CRAIG' }
+    expect(Object.keys((await send(S, 'any update?', t)).got)).toEqual(['melissa'])
+    expect((await send(S, `<@${ADA}> you take the code part`, t)).got).toEqual({
+      ada: { text: 'you take the code part', mentionsYou: true },
+    })
+    expect(Object.keys((await send(S, 'done?', t)).got)).toEqual(['ada'])
+  })
+
+  test('a single mention reaches only that bot, command form stripped', async () => {
+    expect((await send(mk(), `<@${ADA}> check the deploy`)).got).toEqual({
+      ada: { text: 'check the deploy', mentionsYou: true },
+    })
+    expect((await send(mk(), `<@${MELISSA}> check the deploy`)).got).toEqual({
+      melissa: { text: 'check the deploy', mentionsYou: true },
+    })
+  })
+
+  test('a mid-text mention of Melissa is kept as @you and routes to her only', async () => {
+    expect((await send(mk(), `can <@${MELISSA}> check the deploy`)).got).toEqual({
+      melissa: { text: 'can @you check the deploy', mentionsYou: true },
+    })
+  })
+
+  test('no mention: ambient Ada only, text unchanged, mentionsYou false', async () => {
+    expect((await send(mk(), 'CI is red on console main')).got).toEqual({
+      ada: { text: 'CI is red on console main', mentionsYou: false },
+    })
   })
 })
