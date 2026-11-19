@@ -20297,3 +20297,87 @@ describe('shared channel — two-session matrix (latest mention owns the thread)
     expect((await send(S, 'done?', { ts: open.ts, parent: 'U_CRAIG' })).handled).toEqual(['dev'])
   })
 })
+
+describe('H-20261119-055 — self-mentions keep the message shape', () => {
+  // Real ids from the incident (#developer-chat 1795112683.156139).
+  const ADA = 'U0BNA0EUA78'
+  const MELISSA = 'U0B1QKDKJBS'
+  const both = `<@${ADA}> and <@${MELISSA}> please look into vercel board`
+
+  test('both-mention: each bot sees @you for itself and the other bot id', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    // Leading self-mention is the command form, so Ada's copy drops it.
+    expect(normalizeSelfMentions(both, ADA)).toEqual({
+      text: `and <@${MELISSA}> please look into vercel board`,
+      mentionsYou: true,
+    })
+    expect(normalizeSelfMentions(both, MELISSA)).toEqual({
+      text: `<@${ADA}> and @you please look into vercel board`,
+      mentionsYou: true,
+    })
+    // Second bot listed first: the other order keeps @you mid-text.
+    const swapped = `<@${MELISSA}> and <@${ADA}> check it`
+    expect(normalizeSelfMentions(swapped, ADA).text).toBe(`<@${MELISSA}> and @you check it`)
+  })
+
+  test('leading command: <@me> do X delivers "do X" with mentionsYou', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    expect(normalizeSelfMentions(`<@${ADA}> do X`, ADA)).toEqual({
+      text: 'do X',
+      mentionsYou: true,
+    })
+    expect(normalizeSelfMentions(`  <@${ADA}>\n!clear`, ADA)).toEqual({
+      text: '!clear',
+      mentionsYou: true,
+    })
+  })
+
+  test('no mention: text unchanged and mentionsYou false', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    expect(normalizeSelfMentions('just a message', ADA)).toEqual({
+      text: 'just a message',
+      mentionsYou: false,
+    })
+    expect(normalizeSelfMentions(`ping <@${MELISSA}>`, ADA)).toEqual({
+      text: `ping <@${MELISSA}>`,
+      mentionsYou: false,
+    })
+  })
+
+  test('a mention in the middle only is kept as @you', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    expect(normalizeSelfMentions(`hey <@${ADA}> can you check`, ADA)).toEqual({
+      text: 'hey @you can you check',
+      mentionsYou: true,
+    })
+    expect(normalizeSelfMentions(`thanks <@${ADA}>`, ADA).text).toBe('thanks @you')
+  })
+
+  test('labelled mention form and repeated self-mentions', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    expect(normalizeSelfMentions(`<@${ADA}|ada> ask <@${ADA}|ada> again`, ADA)).toEqual({
+      text: 'ask @you again',
+      mentionsYou: true,
+    })
+  })
+
+  test('unresolved or malformed bot id leaves text untouched', async () => {
+    const { normalizeSelfMentions } = await import('./lib.ts')
+    expect(normalizeSelfMentions(both, '')).toEqual({ text: both, mentionsYou: false })
+    expect(normalizeSelfMentions('<@.*> x', '.*')).toEqual({ text: '<@.*> x', mentionsYou: false })
+  })
+
+  test('deliverEvent wires normalizeSelfMentions and sets meta.mentions_you', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = src.indexOf('async function deliverEvent(')
+    expect(start).toBeGreaterThan(-1)
+    const end = src.indexOf('\nasync function handleMessage(', start)
+    expect(end).toBeGreaterThan(start)
+    const body = src.slice(start, end)
+    expect(body).toContain('normalizeSelfMentions(rawText, botUserId)')
+    expect(body).toContain("meta.mentions_you = 'true'")
+    // The old global strip deleted every self-mention (the bug).
+    expect(body).not.toMatch(/<@\$\{botUserId\}>[^`]*`,\s*'g'\)/)
+    expect(body).toContain('params: { content: text, meta }')
+  })
+})
