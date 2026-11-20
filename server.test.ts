@@ -17,6 +17,11 @@ import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { z } from 'zod'
 import {
+  createLastBotContext,
+  dispatchInboundWithContext,
+  trackBotMessages,
+} from './last-bot-context.ts'
+import {
   type Access,
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
@@ -148,6 +153,223 @@ function extractImportSpecifiers(src: string): string[] {
 // ---------------------------------------------------------------------------
 // gate()
 // ---------------------------------------------------------------------------
+
+describe('last bot message context', () => {
+  const dm = { channel: 'D000TEST', channel_type: 'im', ts: '12.000001', user: 'U000TEST' }
+  const channel = { ...dm, channel: 'C000TEST', channel_type: 'channel' }
+  const prior = { text: '  Did that work?\n', ts: '11.000001' }
+  const identity = () => ({ userId: 'U000BOT', botId: 'B000BOT' })
+  const allowed = () =>
+    makeAccess({
+      dmPolicy: 'allowlist',
+      allowFrom: [dm.user],
+      channels: { [channel.channel]: { requireMention: true, allowFrom: [dm.user] } },
+    })
+
+  async function receive(
+    event: Record<string, unknown>,
+    access: Access,
+    lookup: ReturnType<typeof createLastBotContext>['lookup'],
+  ) {
+    const deliveries: Record<string, string>[] = []
+    let drops = 0
+    let pairs = 0
+    const result = await gate(event, makeOpts({ access, botUserId: identity().userId }))
+    await dispatchInboundWithContext(event, result, lookup, {
+      drop: () => {
+        drops++
+      },
+      pair: async () => {
+        pairs++
+      },
+      deliver: async (context) => {
+        deliveries.push(await context())
+      },
+    })
+    return { deliveries, drops, pairs }
+  }
+
+  test('uses the latest acknowledged send or edit in the same DM before considering history', async () => {
+    const context = createLastBotContext(async () => {
+      throw new Error('unexpected history')
+    }, identity)
+    const chat = {
+      postMessage: async (args: { channel: string; text?: string }) => ({
+        ok: true,
+        channel: dm.channel,
+        ts: args.text === 'missing timestamp' ? undefined : '11.000001',
+        text: args.text,
+      }),
+      update: async (args: { channel: string; ts: string; text?: string }) => ({
+        ok: args.text !== 'failed edit',
+        channel: args.channel,
+        ts: args.ts,
+        message: { text: args.text },
+      }),
+    }
+    trackBotMessages(chat, context.remember)
+    await chat.postMessage({ channel: dm.user, text: 'draft' })
+    expect(await context.lookup(dm.channel, dm.ts)).toEqual({ ts: prior.ts, text: 'draft' })
+    await chat.update({ channel: dm.channel, ts: prior.ts, text: prior.text })
+    await chat.postMessage({ channel: dm.user, text: 'missing timestamp' })
+    await chat.update({ channel: dm.channel, ts: prior.ts, text: 'failed edit' })
+    await chat.update({ channel: dm.channel, ts: '10.000001', text: 'older edit' })
+    await chat.update({ channel: 'D001TEST', ts: prior.ts, text: 'another DM' })
+    expect((await receive(dm, allowed(), context.lookup)).deliveries).toEqual([
+      { last_bot_message: prior.text, last_bot_ts: prior.ts },
+    ])
+  })
+
+  test('limits cold history to one request in the same conversation and only uses the bot’s own prior text', async () => {
+    const requests: object[] = []
+    const context = createLastBotContext(async (args) => {
+      requests.push(args)
+      return {
+        messages: [
+          { ...prior, ts: '11.000003', bot_id: 'B001BOT', text: 'peer' },
+          { ...prior, ts: dm.ts, user: identity().userId, text: 'newer' },
+          { user: identity().userId, ts: '11.000008' },
+          { ...prior, user: identity().userId, ts: '' },
+          { ...prior, bot_id: identity().botId },
+          { ...prior, ts: '10.000001', user: identity().userId, text: 'older' },
+        ],
+      }
+    }, identity)
+    expect((await receive(dm, allowed(), context.lookup)).deliveries).toEqual([
+      { last_bot_message: prior.text, last_bot_ts: prior.ts },
+    ])
+    expect(requests).toEqual([{ channel: dm.channel, latest: dm.ts, limit: 5 }])
+  })
+
+  test('delivers a DM without context when history has no bot message', async () => {
+    const context = createLastBotContext(
+      async () => ({ messages: [{ ...prior, user: dm.user }] }),
+      identity,
+    )
+    expect((await receive(dm, allowed(), context.lookup)).deliveries).toEqual([{}])
+  })
+
+  test('adds context to an allowed top-level channel message and skips threaded messages', async () => {
+    const lookups: string[] = []
+    const lookup = async (id: string) => {
+      lookups.push(id)
+      return prior
+    }
+    const mentioned = { ...channel, text: '<@U000BOT> hello' }
+    expect((await receive(mentioned, allowed(), lookup)).deliveries).toEqual([
+      { last_bot_message: prior.text, last_bot_ts: prior.ts },
+    ])
+    expect(
+      (await receive({ ...mentioned, thread_ts: '10.000001' }, allowed(), lookup)).deliveries,
+    ).toEqual([{}])
+    expect(
+      (await receive({ ...dm, thread_ts: '10.000001' }, allowed(), lookup)).deliveries,
+    ).toEqual([{}])
+    expect(lookups).toEqual([channel.channel])
+  })
+
+  test('does not look up or deliver messages rejected by the DM or channel gate', async () => {
+    let lookups = 0
+    const lookup = async () => {
+      lookups++
+      return prior
+    }
+    const dropped = { deliveries: [], drops: 1, pairs: 0 }
+    expect(await receive({ ...dm, user: 'U001TEST' }, allowed(), lookup)).toEqual(dropped)
+    expect(await receive(channel, allowed(), lookup)).toEqual(dropped)
+    expect(
+      await receive(
+        { ...channel, channel: 'C001TEST', text: '<@U000BOT> hello' },
+        allowed(),
+        lookup,
+      ),
+    ).toEqual(dropped)
+    expect(lookups).toBe(0)
+  })
+
+  test('preserves pairing without looking up or delivering chat context', async () => {
+    let lookups = 0
+    const lookup = async () => {
+      lookups++
+      return prior
+    }
+    expect(await receive(dm, makeAccess({ dmPolicy: 'pairing' }), lookup)).toEqual({
+      deliveries: [],
+      drops: 0,
+      pairs: 1,
+    })
+    expect(lookups).toBe(0)
+  })
+
+  test('truncates after 300 Unicode code points without splitting an emoji', async () => {
+    const prefix = `${'x'.repeat(299)}😀`
+    const lookup = async () => ({ ...prior, text: `${prefix}tail` })
+    expect((await receive(dm, allowed(), lookup)).deliveries).toEqual([
+      { last_bot_message: `${prefix}…`, last_bot_ts: prior.ts },
+    ])
+  })
+
+  test('delivers without context if history fails', async () => {
+    const context = createLastBotContext(async () => {
+      throw new Error('history unavailable')
+    }, identity)
+    expect((await receive(dm, allowed(), context.lookup)).deliveries).toEqual([{}])
+  })
+
+  test('skips later cached messages and evicts the oldest conversation when full', async () => {
+    const context = createLastBotContext(async () => ({ messages: [] }), identity)
+    context.remember(dm.channel, { ...prior, ts: dm.ts })
+    expect(await context.lookup(dm.channel, dm.ts)).toBeUndefined()
+    for (let index = 0; index < 256; index++) context.remember(`DTEST${index}`, prior)
+    expect(await context.lookup(dm.channel, '13.000001')).toBeUndefined()
+    expect(await context.lookup('DTEST255', dm.ts)).toEqual(prior)
+  })
+
+  test('uses an acknowledged edit that completes during history', async () => {
+    const context = createLastBotContext(async () => {
+      context.remember(dm.channel, prior)
+      return { messages: [{ user: identity().userId, ts: prior.ts, text: 'stale text' }] }
+    }, identity)
+    expect(await context.lookup(dm.channel, dm.ts)).toEqual(prior)
+  })
+
+  test('skips history before the bot identity is known', async () => {
+    let calls = 0
+    const context = createLastBotContext(
+      async () => {
+        calls++
+        return {}
+      },
+      () => ({ userId: '', botId: '' }),
+    )
+    expect(await context.lookup(dm.channel, dm.ts)).toBeUndefined()
+    expect(calls).toBe(0)
+  })
+
+  test('skips lookup for an incomplete inbound message', async () => {
+    const lookup = async () => prior
+    for (const invalid of [
+      { ...dm, channel: undefined },
+      { ...dm, channel: ' ' },
+      { ...dm, ts: undefined },
+      { ...dm, ts: ' ' },
+    ]) {
+      expect((await receive(invalid, allowed(), lookup)).deliveries).toEqual([{}])
+    }
+  })
+
+  test('keeps pairing codes and restart challenges out of notifications', async () => {
+    for (const text of [
+      'Your pairing code is still: *TEST*',
+      'Hi! I need to verify you before connecting.\nYour pairing code: *TEST*',
+      'Confirm with: `!restart TEST` in <#C000TEST> within 60s.',
+    ]) {
+      expect((await receive(dm, allowed(), async () => ({ ...prior, text }))).deliveries).toEqual([
+        {},
+      ])
+    }
+  })
+})
 
 describe('gate', () => {
   test('drops messages with bot_id', async () => {
