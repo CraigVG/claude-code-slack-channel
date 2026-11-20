@@ -51,6 +51,7 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
+  FetchMessagesInput,
   findReservedActionId,
   formatVerifyResult,
   type GateResult,
@@ -66,6 +67,7 @@ import {
   listSessions as libListSessions,
   makeIdempotentSend,
   nextSocketStartBackoffMs,
+  normalizeSelfMentions,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseExpectedGenesisArg,
@@ -881,7 +883,8 @@ const mcp = new Server(
 // Tools — definition
 // ---------------------------------------------------------------------------
 
-// Per-tool Zod input schemas. Co-located with the tools list so the
+// Per-tool Zod input schemas (FetchMessagesInput is shared from lib.ts).
+// The remaining schemas are co-located with the tools list so the
 // JSON Schema (what the MCP client sees) and the runtime validator
 // stay visibly in sync. `.strict()` rejects unknown keys so a malformed
 // or crafted tool call cannot smuggle in extra fields. Each schema
@@ -927,14 +930,6 @@ const EditMessageInput = z
      *  the notification fallback: chat.update REPLACES the message wholesale,
      *  so a text-only update on a Block Kit message deletes its blocks. */
     blocks: z.array(z.record(z.string(), z.unknown())).optional(),
-  })
-  .strict()
-
-const FetchMessagesInput = z
-  .object({
-    channel: z.string().min(1),
-    limit: z.number().int().positive().optional(),
-    thread_ts: z.string().optional(),
   })
   .strict()
 
@@ -3597,11 +3592,12 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     meta.attachments = fileDescs.join('; ')
   }
 
-  // Strip bot mention from text if present
-  let text = (ev.text as string | undefined) || ''
-  if (botUserId) {
-    text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
-  }
+  // Strip only a leading self-mention (command form); other self-mentions
+  // become `@you` so a message naming several bots keeps its meaning for
+  // each of them (H-20261119-055). mentions_you flags any self-mention.
+  const rawText = (ev.text as string | undefined) || ''
+  const { text, mentionsYou } = normalizeSelfMentions(rawText, botUserId)
+  if (mentionsYou) meta.mentions_you = 'true'
 
   // Push into Claude Code session via MCP notification
   mcp.notification({

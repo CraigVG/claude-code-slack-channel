@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Package identity** (`claude-2y7y.8`): the package name now matches the repository, `claude-code-slack-channel`. The explicit `bin` map keeps `claude-channel-slack` as an executable alias alongside `claude-code-slack-channel`, both pointing to `server.ts`. The Claude plugin remains `slack-channel`; its commands, MCP server identity, state paths and dependency versions are unchanged. This source change does not publish or rename an npm registry package.
+
+### Security
+
+- **Validation dependency migration** (`claude-4l09.11`, ADR-005): Zod 4.6.6 and body-parser 2.4.0 replace vulnerable resolutions, including nested SDK/mutation-tool Zod copies. The session data record uses explicit key/value schemas. Journal sequence, policy priority and fetch-message limit retain their legacy integer domain instead of silently acquiring a safe-integer ceiling. Seven bounded migration checks preserve session/outbox, policy, journal and ACP contracts and distinguish patched collection rejection from the old per-item issue accumulation. Diagnostic issue formatting follows Zod 4. No tool, authorization, native configuration or on-disk field/version changes.
+
+- **Display-name control cleanup** (`claude-2y7y.6`): `sanitizeDisplayName` now strips C1 controls (U+0080–U+009F, including CSI) alongside C0 and DEL before names enter channel metadata. Regression tests cover every code point in these ranges, control-only names, and ordinary Unicode preservation. This is display-name cleanup, not message-body sanitization or a general prompt-injection defense.
+- **Required audit gate repair**: the lockfile lifts runtime transitive `@slack/web-api` → `axios` → `follow-redirects` from 1.16.0 to 1.16.1, resolving GHSA-q3jh-wrc6-jgq8 and GHSA-8r9p-f939-6h3c. The existing dependency ranges and audit exceptions are unchanged.
+
+- **Dependency advisories cleared (#298).** `@modelcontextprotocol/sdk` 1.29.0 → 1.32.1 (GHSA-6qxp-vccf-f47h, OAuth client credential redirection; not used by this server). The `axios` override floor `^1.18.1` → `^1.20.0` closes 7 high advisories in `@slack/web-api`'s HTTP client, including redirect-based SSRF (GHSA-r4gj-5m52-g5wh). A new `proxy-addr` `^2.0.8` floor clears a critical advisory on the SDK → express path. `bun audit --audit-level=high` is clean again.
+
+### Fixed
+
+- **Inbound self-mentions keep the message shape** (H-20261119-055). `deliverEvent` stripped every `<@bot>` mention of the receiving bot with a global replace, so in `<@A> and <@B> please look` bot A saw `and <@B> please look` and bot B saw `<@A> and please look`; each read the message as addressed to the other. The new `normalizeSelfMentions()` in `lib.ts` strips only a leading self-mention (the `<@me> do X` command form), replaces any other self-mention with `@you`, and the delivered `<channel>` tag carries `mentions_you="true"` whenever the bot is mentioned anywhere. Mentions of other users are left as-is.
+
 ### Docs
+
+- **All four public operator skills refreshed for the current Claude Code Channels contract** (`ccsc-7l9`). `access`, `configure`, `install`, and `policy` now document both supported Claude authentication paths (claude.ai or Anthropic Console API key), the organization-policy requirement, unsupported hosted-provider environments, exact Slack token roles, rollback paths, and security boundaries. Each skill is versioned `1.1.0`, scores Grade A under the marketplace rubric, and passes the Tier-2 production gate. The plugin manifest now matches release `0.12.0` and carries the marketplace-tier homepage/commands fields. The dependency lock also lifts transitive `fast-uri` and `browserslist` to patched releases so the existing high-severity audit gate remains green.
 
 - **ADR-004 amendment — interactive Block Kit *output* is in scope (Decision 2a)** (`ccsc-37k`, triggered by the 360° review of #270 / `ccsc-ysu`). ADR-004 Decision 2 decided KEEP Block Kit for the *approval/receipt UI* and framed the differentiator as "the record, not the widget," but was silent on interactive **output** on the `reply` tool (agent-authored option buttons whose clicks return as journaled inbound events). The amendment records that surface as **in scope** because it uses the portable Block Kit floor (not Tag-era native components) and is **fully journaled on drop and deliver** (deepening the provable-record moat, not chasing widget polish), and sets the bright line for the next ask: **portable ∧ journaled ∧ non-native-component-coupled**. Each further interactive primitive (modals, selects, native components) still needs its own decision — no Tag feature-parity roadmap. Honest cost recorded: a refinement of the "record, not widget" purity, not a reversal. The #270 feature itself is accept-with-conditions (`ccsc-ysu`), not yet merged.
 
