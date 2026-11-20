@@ -20,8 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Dependency advisories cleared (#298).** `@modelcontextprotocol/sdk` 1.29.0 → 1.32.1 (GHSA-6qxp-vccf-f47h, OAuth client credential redirection; not used by this server). The `axios` override floor `^1.18.1` → `^1.20.0` closes 7 high advisories in `@slack/web-api`'s HTTP client, including redirect-based SSRF (GHSA-r4gj-5m52-g5wh). A new `proxy-addr` `^2.0.8` floor clears a critical advisory on the SDK → express path. `bun audit --audit-level=high` is clean again.
 
+### Added
+
+- **Private inline images in Block Kit cards.** An image block or element in `reply` / `edit_message` blocks may give `slack_file: { "path": "/abs/file.png" }` (png/jpg/gif). The file passes the same outbound checks as reply `files` (SLACK_SENDABLE_ROOTS + denylist, secret-value scan of bytes and filename), is uploaded WITHOUT a channel (never shared, posts no message of its own), and is swapped for `slack_file: { id }` only after `files.info` shows Slack has processed it (backoff 250/500/1000/2000 ms, 20 s budget). If it never becomes ready the reply fails and the card is not posted. New module `private-image-blocks.ts`.
+
 ### Fixed
 
+- **Multi-file replies post in the order given.** Each file used to upload with its own `filesUploadV2` call, which shares it as its own message, and Slack could land them out of order. The direct path now guards every file first and uploads them in ONE `filesUploadV2` call (`file_uploads`), which the SDK completes with a single `completeUploadExternal`: one message, files in order. The durable path does the same through the new optional `FileUploadDeps.uploadMany`; a blocked file now fails the whole batch (nothing uploads) instead of letting its siblings go out separately. Redelivery by the poller after a transient failure still uploads one file per obligation.
 - **Inbound self-mentions keep the message shape** (H-20261119-055). `deliverEvent` stripped every `<@bot>` mention of the receiving bot with a global replace, so in `<@A> and <@B> please look` bot A saw `and <@B> please look` and bot B saw `<@A> and please look`; each read the message as addressed to the other. The new `normalizeSelfMentions()` in `lib.ts` strips only a leading self-mention (the `<@me> do X` command form), replaces any other self-mention with `@you`, and the delivered `<channel>` tag carries `mentions_you="true"` whenever the bot is mentioned anywhere. Mentions of other users are left as-is.
 
 ### Docs

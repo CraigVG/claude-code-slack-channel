@@ -478,6 +478,14 @@ export interface FileUploadDeps {
    *  guarded bytes are sent verbatim. Throws on Slack failure (the caller
    *  classifies for retry / dead-letter). */
   upload(obligation: DeliveryObligation, bytes: Uint8Array): Promise<string>
+  /** Upload SEVERAL already-guarded files as ONE Slack message, in the given
+   *  order (one `filesUploadV2` call with `file_uploads`, which the SDK finishes
+   *  with a single `completeUploadExternal`). Resolves the file ids in the same
+   *  order (`''` where Slack's response carries none). Separate per-file uploads
+   *  each share as their own message and Slack can land them out of order, so
+   *  the inline durable path uses this when a reply has 2+ files. Optional:
+   *  without it each file uploads on its own. */
+  uploadMany?(obligations: DeliveryObligation[], bytes: Uint8Array[]): Promise<string[]>
 }
 
 /** Idempotent, guarded durable file upload (ccsc-o7x.5). Order is **dedup →
@@ -581,54 +589,140 @@ export async function deliverFileReplyDurably(
   await recordBeforeSend(() => handle.recordTerminalDeliveries(token, records))
 
   const total = records.length
+  const asObligation = (record: (typeof records)[number]): DeliveryObligation => ({
+    ...record,
+    attempts: 0,
+    state: 'pending',
+    createdAt: 0,
+  })
   let firstTs: string | undefined
   let messagesSent = 0
-  let filesSent = 0
   let delivered = 0
-  for (const record of records) {
-    const obligation: DeliveryObligation = {
-      ...record,
-      attempts: 0,
-      state: 'pending',
-      createdAt: 0,
-    }
+  for (const record of textRecords) {
+    const obligation = asObligation(record)
     try {
-      if (obligation.upload !== undefined) {
-        const fileId = await sendFileObligation(deps.files, obligation)
-        await markObligation(handle, token, obligation.id, {
+      const ts = await deps.post(obligation, deliveryIdempotencyKey(obligation))
+      if (messagesSent === 0) firstTs = ts
+      await markObligation(handle, token, obligation.id, { state: 'delivered', attempts: 1 })
+      messagesSent++
+      delivered++
+    } catch (err) {
+      if (await markFailed(handle, token, [obligation.id], err)) throw err
+      // Transient: leave this item (and every later one) pending and STOP — the
+      // poller redelivers the tail in order.
+      return { status: 'queued', delivered, pending: total - delivered }
+    }
+  }
+  const files = await deliverFileObligations(handle, token, deps.files, fileRecords.map(asObligation))
+  delivered += files.sent
+  if (files.queued) return { status: 'queued', delivered, pending: total - delivered }
+  return { status: 'delivered', ts: firstTs, messagesSent, filesSent: files.sent }
+}
+
+/** Mark `ids` after a failed send: `dead` (and return true → caller rethrows)
+ *  for an `ExfilBlockedError` or a non-retryable Slack code, else `pending`
+ *  (return false → caller stops; the poller redelivers in order). */
+async function markFailed(
+  handle: SessionHandle,
+  token: number,
+  ids: string[],
+  err: unknown,
+): Promise<boolean> {
+  const code = extractSlackErrorCode(err)
+  const lastError = code ?? (err instanceof Error ? err.message : String(err))
+  const nonRetryable =
+    err instanceof ExfilBlockedError || classifyDeliveryError(code) === 'non-retryable'
+  for (const id of ids) {
+    await markObligation(handle, token, id, {
+      state: nonRetryable ? 'dead' : 'pending',
+      attempts: 1,
+      lastError,
+    })
+  }
+  return nonRetryable
+}
+
+/** Deliver a reply's file obligations, in order. With `uploadMany` and 2+
+ *  files, every file is deduped and read+guarded FIRST, then all of them upload
+ *  as ONE message (order preserved, nothing uploads if any guard blocks).
+ *  Otherwise each file goes through `sendFileObligation` on its own (the
+ *  previous behaviour). On failure the not-yet-delivered files are marked
+ *  together: `dead` + rethrow for a block / non-retryable error, `pending` +
+ *  `queued` for a transient one (the poller then redelivers them one by one). */
+async function deliverFileObligations(
+  handle: SessionHandle,
+  token: number,
+  files: FileUploadDeps,
+  obs: DeliveryObligation[],
+): Promise<{ sent: number; queued: boolean }> {
+  let sent = 0
+  if (files.uploadMany === undefined || obs.length < 2) {
+    for (const ob of obs) {
+      try {
+        const fileId = await sendFileObligation(files, ob)
+        await markObligation(handle, token, ob.id, {
           state: 'delivered',
           attempts: 1,
           uploadedFileId: fileId,
         })
-        filesSent++
-      } else {
-        const ts = await deps.post(obligation, deliveryIdempotencyKey(obligation))
-        if (messagesSent === 0) firstTs = ts
-        await markObligation(handle, token, obligation.id, { state: 'delivered', attempts: 1 })
-        messagesSent++
+        sent++
+      } catch (err) {
+        if (await markFailed(handle, token, [ob.id], err)) throw err
+        return { sent, queued: true }
       }
-      delivered++
-    } catch (err) {
-      const code = extractSlackErrorCode(err)
-      const lastError = code ?? (err instanceof Error ? err.message : String(err))
-      const nonRetryable =
-        err instanceof ExfilBlockedError || classifyDeliveryError(code) === 'non-retryable'
-      if (nonRetryable) {
-        await markObligation(handle, token, obligation.id, { state: 'dead', attempts: 1, lastError })
-        throw err
-      }
-      // Transient: leave this item (and every later one) pending and STOP — the
-      // poller redelivers the tail in order.
-      await markObligation(handle, token, obligation.id, { state: 'pending', attempts: 1, lastError })
-      return { status: 'queued', delivered, pending: total - delivered }
     }
+    return { sent, queued: false }
   }
-  return { status: 'delivered', ts: firstTs, messagesSent, filesSent }
+  const batch: DeliveryObligation[] = []
+  const bytes: Uint8Array[] = []
+  const deduped = new Set<string>()
+  try {
+    for (const ob of obs) {
+      const existing = await files.findUploaded(ob)
+      if (existing) {
+        await markObligation(handle, token, ob.id, {
+          state: 'delivered',
+          attempts: 1,
+          uploadedFileId: existing,
+        })
+        deduped.add(ob.id)
+        continue
+      }
+      if (ob.upload === undefined) throw new Error('file obligation has no upload descriptor')
+      bytes.push(await files.readAndGuard(ob.upload))
+      batch.push(ob)
+    }
+    const ids = batch.length > 0 ? await files.uploadMany(batch, bytes) : []
+    for (const [i, ob] of batch.entries()) {
+      await markObligation(handle, token, ob.id, {
+        state: 'delivered',
+        attempts: 1,
+        uploadedFileId: ids[i] ?? '',
+      })
+    }
+    return { sent: obs.length, queued: false }
+  } catch (err) {
+    // Nothing uploaded yet: the failure is a dedup scan, a guard block, or the
+    // single uploadMany call. Every file not already deduped fails together, so
+    // a blocked file never lets its siblings go out as separate messages.
+    const failed = obs.filter((o) => !deduped.has(o.id)).map((o) => o.id)
+    if (await markFailed(handle, token, failed, err)) throw err
+    return { sent: deduped.size, queued: true }
+  }
 }
 
 /** Pull the uploaded Slack file id out of a `filesUploadV2` response, tolerant of
  *  the SDK's nested/loose shape. Returns `''` if none is extractable — callers
  *  treat that as "no recorded id" and fall back to the `(filename, size)` scan. */
+/** File ids, in upload order, from a multi-file `filesUploadV2` response: one
+ *  completion per destination, whose `files` keep the request order. Pads with
+ *  `''` (no recorded id → dedup falls back to the filename/size scan). */
+export function extractUploadedFileIds(res: unknown, count: number): string[] {
+  const r = res as { files?: Array<{ id?: string; files?: Array<{ id?: string }> }> }
+  const ids = (r.files ?? []).flatMap((c) => (c.files ? c.files.map((f) => f.id ?? '') : [c.id ?? '']))
+  return Array.from({ length: count }, (_, i) => ids[i] ?? '')
+}
+
 function extractUploadedFileId(res: unknown): string {
   const r = res as { files?: Array<{ id?: string; files?: Array<{ id?: string }> }> }
   const first = r.files?.[0]
@@ -733,6 +827,22 @@ export function createFileSendDeps(deps: {
         // destination); the reply tool casts the same way (executeReplyFileUploads).
       } as Parameters<typeof deps.client.filesUploadV2>[0])
       return extractUploadedFileId(res)
+    },
+    async uploadMany(obligations, bytes): Promise<string[]> {
+      const first = obligations[0]
+      if (first === undefined) return []
+      const fileUploads = obligations.map((ob, i) => {
+        if (ob.upload === undefined || bytes[i] === undefined) {
+          throw new Error('createFileSendDeps.uploadMany: obligation has no upload descriptor')
+        }
+        return { file: Buffer.from(bytes[i]), filename: ob.upload.filename }
+      })
+      const res = await deps.client.filesUploadV2({
+        channel_id: first.channel,
+        ...(first.thread ? { thread_ts: first.thread } : {}),
+        file_uploads: fileUploads,
+      } as Parameters<typeof deps.client.filesUploadV2>[0])
+      return extractUploadedFileIds(res, obligations.length)
     },
   }
 }
