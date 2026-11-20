@@ -21000,6 +21000,178 @@ describe('ordered multi-file reply — deliverFileReplyDurably batch', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Craig 1795195321.851429 — N image files + text post as ONE message
+// ---------------------------------------------------------------------------
+
+describe('reply images — one message with all the photos in', () => {
+  test('splitReplyFiles: png/jpg/gif are images, in order; webp/pdf keep the file share', async () => {
+    const { splitReplyFiles } = await import('./private-image-blocks.ts')
+    expect(
+      splitReplyFiles(['/a/1.png', '/a/2.pdf', '/a/3.GIF', '/a/4.webp', '/a/5.jpeg', '/a/6.jpg']),
+    ).toEqual({
+      images: ['/a/1.png', '/a/3.GIF', '/a/5.jpeg', '/a/6.jpg'],
+      others: ['/a/2.pdf', '/a/4.webp'],
+    })
+    expect(splitReplyFiles(undefined)).toEqual({ images: [], others: [] })
+  })
+
+  test('4 images become exactly 1 chat.postMessage with the text + 4 image blocks in order', async () => {
+    const { composeImageReplyBlocks, createPrivateImageDeps, resolvePrivateImageBlocks } =
+      await import('./private-image-blocks.ts')
+    const { createReplyPoster } = await import('./slack-delivery.ts')
+    const uploads: Array<Record<string, unknown>> = []
+    const posts: Array<Record<string, any>> = []
+    const client = {
+      async filesUploadV2(args: Record<string, unknown>) {
+        uploads.push(args)
+        const n = (args.file_uploads as unknown[]).length
+        return { files: [{ files: Array.from({ length: n }, (_, i) => ({ id: `F${i + 1}` })) }] }
+      },
+      files: { info: async () => ({ file: { original_w: 10 } }) },
+      chat: {
+        async postMessage(args: Record<string, unknown>) {
+          posts.push(args)
+          return { ok: true, ts: '1.2' }
+        },
+      },
+    }
+    const paths = ['/r/a.png', '/r/b.jpg', '/r/c.gif', '/r/d.png']
+    const composed = composeImageReplyBlocks('four photos', paths, undefined)
+    const blocks = await resolvePrivateImageBlocks(
+      composed,
+      createPrivateImageDeps({
+        client,
+        assertSendable: () => {},
+        assertNoSecretValues: () => {},
+        journalExfilBlock: () => {},
+        readFile: () => new Uint8Array([1]),
+      }),
+    )
+    // The poster the reply tool sends a blocks reply through (durable path).
+    const post = createReplyPoster(client as any)
+    await post({ id: 'r', channel: 'C1', thread: 'T1', payload: 'four photos', blocks } as any, 'k')
+    // ONE private upload of all 4 (no channel → no per-file messages) ...
+    expect(uploads).toHaveLength(1)
+    expect(uploads[0]).not.toHaveProperty('channel_id')
+    expect(uploads[0]).not.toHaveProperty('channels')
+    expect(
+      (uploads[0]!.file_uploads as Array<{ filename: string }>).map((f) => f.filename),
+    ).toEqual(['a.png', 'b.jpg', 'c.gif', 'd.png'])
+    // ... then exactly ONE chat.postMessage: text section + 4 image blocks in order.
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.blocks).toEqual([
+      { type: 'section', text: { type: 'mrkdwn', text: 'four photos' } },
+      { type: 'image', slack_file: { id: 'F1' }, alt_text: 'a.png' },
+      { type: 'image', slack_file: { id: 'F2' }, alt_text: 'b.jpg' },
+      { type: 'image', slack_file: { id: 'F3' }, alt_text: 'c.gif' },
+      { type: 'image', slack_file: { id: 'F4' }, alt_text: 'd.png' },
+    ])
+    expect(posts[0]!.thread_ts).toBe('T1')
+  })
+
+  test('planImageReply: image files become one blocks message; only non-images stay files', async () => {
+    const { planImageReply } = await import('./private-image-blocks.ts')
+    const abs = (p: string) => `/abs/${p}`
+    const plan = planImageReply('look', ['a.png', 'notes.pdf', 'b.gif'], undefined, abs)
+    expect(plan.files).toEqual(['notes.pdf'])
+    expect(plan.blocks).toEqual([
+      { type: 'section', text: { type: 'mrkdwn', text: 'look' } },
+      { type: 'image', slack_file: { path: '/abs/a.png' }, alt_text: 'a.png' },
+      { type: 'image', slack_file: { path: '/abs/b.gif' }, alt_text: 'b.gif' },
+    ])
+    expect(planImageReply('x', ['a.png'], undefined, abs).files).toBeUndefined()
+    // No image files: text, files and blocks pass through untouched.
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: 'card' } }]
+    expect(planImageReply('x', ['n.pdf'], blocks, abs)).toEqual({ blocks, files: ['n.pdf'] })
+    expect(planImageReply('x', undefined, undefined, abs)).toEqual({
+      blocks: undefined,
+      files: undefined,
+    })
+  })
+
+  test('buttons stay under the pictures: images go just above the first actions block', async () => {
+    const { composeImageReplyBlocks } = await import('./private-image-blocks.ts')
+    const title = { type: 'section', text: { type: 'mrkdwn', text: '*Pick one*' } }
+    const actions = { type: 'actions', elements: [{ type: 'button', action_id: 'ok', value: '1' }] }
+    const out = composeImageReplyBlocks('fallback', ['/r/a.png', '/r/b.png'], [title, actions])
+    expect(out.map((b) => b.type)).toEqual(['section', 'image', 'image', 'actions'])
+    expect(out[0]).toBe(title)
+    expect(out[3]).toBe(actions)
+    // Caller blocks with no text block: the text goes on top; no actions → images at the end.
+    const ctxOnly = { type: 'context', elements: [] }
+    expect(composeImageReplyBlocks('hi', ['/r/a.png'], [ctxOnly]).map((b) => b.type)).toEqual([
+      'section',
+      'context',
+      'image',
+    ])
+    // Buttons only: text on top, pictures, then the buttons.
+    expect(composeImageReplyBlocks('hi', ['/r/a.png'], [actions]).map((b) => b.type)).toEqual([
+      'section',
+      'image',
+      'actions',
+    ])
+  })
+
+  test('long text splits into 3000-char sections; over 50 blocks throws before any upload', async () => {
+    const { composeImageReplyBlocks } = await import('./private-image-blocks.ts')
+    const out = composeImageReplyBlocks('x'.repeat(6500), ['/r/a.png'], undefined)
+    expect(out.map((b) => b.type)).toEqual(['section', 'section', 'section', 'image'])
+    expect((out[2]!.text as { text: string }).text.length).toBe(500)
+    const many = Array.from({ length: 50 }, (_, i) => `/r/${i}.png`)
+    expect(() => composeImageReplyBlocks('t', many, undefined)).toThrow(
+      /51 blocks; Slack allows 50/,
+    )
+    expect(composeImageReplyBlocks('t', many.slice(1), undefined)).toHaveLength(50)
+  })
+
+  test('a blocked image file stops the whole reply before anything uploads', async () => {
+    const { composeImageReplyBlocks, createPrivateImageDeps, resolvePrivateImageBlocks } =
+      await import('./private-image-blocks.ts')
+    let uploads = 0
+    const deps = createPrivateImageDeps({
+      client: {
+        async filesUploadV2() {
+          uploads++
+          return { files: [] }
+        },
+        files: { info: async () => ({}) },
+      },
+      assertSendable: (p) => {
+        if (p.endsWith('.env.png')) throw new Error('blocked: state dir')
+      },
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: () => new Uint8Array([1]),
+    })
+    const blocks = composeImageReplyBlocks('t', ['/r/a.png', '/s/.env.png'], undefined)
+    await expect(resolvePrivateImageBlocks(blocks, deps)).rejects.toThrow('blocked: state dir')
+    expect(uploads).toBe(0)
+  })
+
+  test('wiring: executeReply composes image files into blocks BEFORE the block guards and upload', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = src.indexOf('async function executeReply(')
+    const fn = src.slice(start, src.indexOf('\nasync function executeReact(', start))
+    const textGuard = fn.indexOf("guardOutboundSecretValues(text, 'reply', ctx)")
+    const compose = fn.indexOf('planImageReply(text, argFiles, blocks, (f) => resolve(f))')
+    const blockGuard = fn.indexOf("guardOutboundSecretValues(JSON.stringify(blocks), 'reply'")
+    const reserved = fn.indexOf('findReservedActionId(blocks)')
+    const upload = fn.indexOf("resolveCardImages(blocks, 'reply', ctx)")
+    expect(textGuard).toBeGreaterThan(-1)
+    expect(compose).toBeGreaterThan(textGuard)
+    expect(blockGuard).toBeGreaterThan(compose)
+    expect(reserved).toBeGreaterThan(blockGuard)
+    expect(upload).toBeGreaterThan(reserved)
+    expect(fn).toContain('blocks = plan.blocks')
+    expect(fn).toContain('const files = plan.files')
+    // A blocks reply is one message on the direct path too (never chunked).
+    expect(fn).toContain(
+      'const chunks = blocks !== undefined ? [text] : chunkText(text, limit, mode)',
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // H-20261119-057 part B — GIFs and images IN (blocks + legacy attachments)
 // ---------------------------------------------------------------------------
 

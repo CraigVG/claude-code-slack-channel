@@ -126,7 +126,11 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
-import { createPrivateImageDeps, resolvePrivateImageBlocks } from './private-image-blocks.ts'
+import {
+  createPrivateImageDeps,
+  planImageReply,
+  resolvePrivateImageBlocks,
+} from './private-image-blocks.ts'
 import {
   beginDurableStream,
   createDeliverySendDeps,
@@ -1134,7 +1138,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description:
-              'Absolute paths of files to upload (optional). All files post together as one message, in the order given.',
+              'Absolute paths of files to upload (optional). png/jpg/gif images and the text post as ONE message: the text, then one inline image per file in order (if you pass blocks, the images go just above the first actions block so buttons stay under them). Other files post together as one message, in the order given.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1720,7 +1724,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const chatId: string = args.chat_id
   const text: string = args.text
   const threadTs: string | undefined = args.thread_ts
-  const files: string[] | undefined = args.files
+  const argFiles: string[] | undefined = args.files
   const stream: boolean = args.stream === true
   let blocks: Array<Record<string, unknown>> | undefined =
     Array.isArray(args.blocks) && args.blocks.length > 0 ? args.blocks : undefined
@@ -1743,6 +1747,15 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // streaming/non-streaming branch (so both paths are covered) and before the
   // gate.outbound.allow event (a blocked send was never allowed).
   guardOutboundSecretValues(text, 'reply', ctx)
+  // Image files (png/jpg/gif) + the text go out as ONE message: the text and
+  // one image block per file in order, buttons kept under the pictures
+  // (Craig, #developer-chat 1795195321.851429). The image blocks name local
+  // paths, so the block guards below and resolveCardImages give them the same
+  // file checks and ONE private upload before the single post. Other files
+  // keep the ordinary share.
+  const plan = planImageReply(text, argFiles, blocks, (f) => resolve(f))
+  blocks = plan.blocks
+  const files = plan.files
   // The value-exfiltration guard must also cover Block Kit content: a secret
   // pasted into a section block would otherwise bypass the text guard. Blocks
   // are immutable once recorded on the obligation, so this record-time guard

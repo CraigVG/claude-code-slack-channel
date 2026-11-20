@@ -123,6 +123,97 @@ async function waitUntilReady(id: string, deps: PrivateImageDeps, opts: ResolveO
   }
 }
 
+/** True for a reply `files` path Slack can show inline in an image block
+ *  (png/jpg/jpeg/gif). Everything else keeps the ordinary file share. */
+export function isInlineImagePath(path: string): boolean {
+  return IMAGE_EXT_RE.test(path)
+}
+
+/** Split reply `files` into inline images and everything else, each in the
+ *  order given. An image never goes to both. */
+export function splitReplyFiles(files: readonly string[] | undefined): {
+  images: string[]
+  others: string[]
+} {
+  const images: string[] = []
+  const others: string[] = []
+  for (const f of files ?? []) (isInlineImagePath(f) ? images : others).push(f)
+  return { images, others }
+}
+
+/** Slack's per-message block limit, and its section text limit. */
+export const MAX_BLOCKS_PER_MESSAGE = 50
+const SECTION_TEXT_MAX = 3000
+
+type Block = Record<string, unknown>
+
+const TEXT_BLOCK_TYPES = new Set(['section', 'header', 'rich_text'])
+
+/** The blocks for ONE reply message carrying `text` plus one image block per
+ *  ABSOLUTE image path, in order (Craig, #developer-chat 1795195321.851429:
+ *  "one message with all the photos in").
+ *
+ *  - No caller blocks: `[section(text)…, image…]` (text split into ≤3000-char
+ *    sections).
+ *  - Caller blocks: the text section is added on top only when the caller's
+ *    blocks carry no text block of their own (section/header/rich_text); the
+ *    images go immediately BEFORE the first `actions` block, so buttons stay
+ *    under the pictures, or at the end when there is none.
+ *
+ *  The image blocks carry `slack_file: { path }` (alt text = file name), so
+ *  the reply's existing block path guards, privately uploads and swaps in the
+ *  file ids before the single post. Throws (before any upload) past 50 blocks. */
+export function composeImageReplyBlocks(
+  text: string,
+  absImagePaths: readonly string[],
+  callerBlocks: readonly Block[] | undefined,
+): Block[] {
+  const images: Block[] = absImagePaths.map((path) => ({
+    type: 'image',
+    slack_file: { path },
+    alt_text: basenameOf(path).slice(0, 2000) || 'image',
+  }))
+  const caller = callerBlocks ?? []
+  const needsText =
+    text.trim() !== '' && !caller.some((b) => TEXT_BLOCK_TYPES.has(String(b?.type)))
+  const textBlocks: Block[] = []
+  if (needsText) {
+    for (let i = 0; i < text.length; i += SECTION_TEXT_MAX) {
+      textBlocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: text.slice(i, i + SECTION_TEXT_MAX) },
+      })
+    }
+  }
+  const firstActions = caller.findIndex((b) => b?.type === 'actions')
+  const at = firstActions === -1 ? caller.length : firstActions
+  const out = [...textBlocks, ...caller.slice(0, at), ...images, ...caller.slice(at)]
+  if (out.length > MAX_BLOCKS_PER_MESSAGE) {
+    throw new Error(
+      `reply: ${absImagePaths.length} image(s) + text + blocks make ${out.length} blocks; Slack allows ${MAX_BLOCKS_PER_MESSAGE} per message`,
+    )
+  }
+  return out
+}
+
+/** What the reply tool sends for `text` + `files` + optional `blocks`: with
+ *  any png/jpg/gif file, ONE blocks message (`composeImageReplyBlocks`) and
+ *  only the non-image files left to share; otherwise everything unchanged.
+ *  `toAbsolute` resolves each image path. */
+export function planImageReply(
+  text: string,
+  files: readonly string[] | undefined,
+  blocks: Block[] | undefined,
+  toAbsolute: (path: string) => string,
+): { blocks: Block[] | undefined; files: string[] | undefined } {
+  const { images, others } = splitReplyFiles(files)
+  if (images.length === 0) return { blocks, files: files ? [...files] : undefined }
+  return {
+    blocks: composeImageReplyBlocks(text, images.map(toAbsolute), blocks),
+    files: others.length > 0 ? others : undefined,
+  }
+}
+
 /** Upload every local-path image privately, wait until Slack can render each,
  *  and return a deep copy of `blocks` with `slack_file: { id }` in their place.
  *  Blocks without local-path images are returned unchanged (same reference).
