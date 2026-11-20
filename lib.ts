@@ -2238,6 +2238,43 @@ export function stripBotMention(text: string, botUserId: string): string {
   return text.slice(prefix.length).replace(/^\s+/, '')
 }
 
+/** Result of {@link normalizeSelfMentions}. */
+export interface SelfMentionResult {
+  /** Text to deliver to the session. */
+  text: string
+  /** True when the receiving bot is @-mentioned anywhere in the message. */
+  mentionsYou: boolean
+}
+
+/** Normalize the receiving bot's own `<@U_BOT>` mentions in an inbound
+ *  message before it is delivered to the session (H-20261119-055).
+ *
+ *  - A single LEADING self-mention (the command form `<@me> do X`) is
+ *    stripped, as before.
+ *  - Every OTHER self-mention is replaced with `@you`, so a message that
+ *    names several bots keeps its shape: `<@A> and <@B> look` reads as
+ *    `@you and <@B> look` to A and `<@A> and @you look` to B. The old
+ *    global strip deleted every self-mention, so each bot saw only the
+ *    other bot's id and read the message as addressed to someone else.
+ *  - Mentions of other users and bots are left as-is.
+ *  - `mentionsYou` reports whether a self-mention appeared anywhere.
+ *
+ *  Slack may render a mention with a label (`<@U123|name>`); both forms
+ *  are matched. An empty `botUserId` (identity not resolved yet) returns
+ *  the text unchanged with `mentionsYou: false`. */
+export function normalizeSelfMentions(text: string, botUserId: string): SelfMentionResult {
+  // Slack user ids are A-Z/0-9; anything else is not interpolated into a RegExp.
+  if (!/^[A-Z0-9]+$/.test(botUserId)) return { text, mentionsYou: false }
+  const mention = `<@${botUserId}(?:\\|[^>]*)?>`
+  const trimmed = text.trim()
+  if (!new RegExp(mention).test(trimmed)) return { text: trimmed, mentionsYou: false }
+  const out = trimmed
+    .replace(new RegExp(`^${mention}\\s*`), '')
+    .replace(new RegExp(mention, 'g'), '@you')
+    .trim()
+  return { text: out, mentionsYou: true }
+}
+
 // ---------------------------------------------------------------------------
 // Event deduplication
 // ---------------------------------------------------------------------------

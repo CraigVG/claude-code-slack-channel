@@ -66,6 +66,7 @@ import {
   listSessions as libListSessions,
   makeIdempotentSend,
   nextSocketStartBackoffMs,
+  normalizeSelfMentions,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseExpectedGenesisArg,
@@ -3597,11 +3598,12 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     meta.attachments = fileDescs.join('; ')
   }
 
-  // Strip bot mention from text if present
-  let text = (ev.text as string | undefined) || ''
-  if (botUserId) {
-    text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
-  }
+  // Strip only a leading self-mention (command form); other self-mentions
+  // become `@you` so a message naming several bots keeps its meaning for
+  // each of them (H-20261119-055). mentions_you flags any self-mention.
+  const rawText = (ev.text as string | undefined) || ''
+  const { text, mentionsYou } = normalizeSelfMentions(rawText, botUserId)
+  if (mentionsYou) meta.mentions_you = 'true'
 
   // Push into Claude Code session via MCP notification
   mcp.notification({
