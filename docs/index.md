@@ -45,7 +45,7 @@ Security is defense-in-depth: an inbound gate drops ungated messages before they
 | Protocol | MCP (stdio) | Standard Claude Code channel transport |
 | Connection | @slack/socket-mode v2 | Outbound WebSocket to Slack — no public URL |
 | API | @slack/web-api v7 | Send messages, upload files, add reactions, Block Kit interactions |
-| Validation | zod v3 | Schema validation for permission relay + audit journal |
+| Validation | zod (v3 API via `zod/v3`) | Schema validation for permission relay + audit journal |
 | Crypto | Node built-in Ed25519 + RFC 8785 JCS | Signed, canonically-serialized audit events — no new runtime dep |
 | Security | Custom gate + allowlist + tier-aware policy engine | Defense-in-depth: inbound gate, outbound gate, exfiltration guard, system-prompt hardening, token lockdown, signed journal, admin-command HMAC nonce, peer-bot rate limiting |
 | Auditability | Hash-chained + Ed25519-signed append-only journal + Slack projection | Offline-verifiable log of every gate decision, policy evaluation, and admin action — with optional real-time Slack visibility |

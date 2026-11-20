@@ -12,7 +12,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import {
   DEFAULT_CHANNEL_CIRCUIT_BREAKER,
   DEFAULT_PEER_BOT_RATE_LIMIT,

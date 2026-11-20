@@ -37,7 +37,7 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 import { type FileHandle, open as fsOpen, readFile } from 'node:fs/promises'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { type Ed25519KeyPair, signBytes, verifySignatureBytes } from './crypto.ts'
 import type { SessionKey } from './lib'
 
