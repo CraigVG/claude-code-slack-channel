@@ -20566,18 +20566,24 @@ describe('private inline images — findLocalImageRefs / isImageReady', () => {
   })
 })
 
-describe('private inline images — resolvePrivateImageBlocks', () => {
+describe('inline card images — resolvePrivateImageBlocks', () => {
+  const target = { channelId: 'C_CARD', threadTs: '1700000000.000100' }
+
   function fakeDeps(
     opts: {
       readyAfter?: number
       blockPath?: string
       infoThrowsFirst?: boolean
+      uploadErr?: Error
       ids?: string[]
     } = {},
   ) {
     const calls: string[] = []
     const sleeps: number[] = []
-    const uploads: Array<Array<{ filename: string; bytes: number[] }>> = []
+    const uploads: Array<{
+      target: { channelId: string; threadTs?: string }
+      files: Array<{ filename: string; bytes: number[] }>
+    }> = []
     const polls = new Map<string, number>()
     const deps = {
       readAndGuard: (path: string, filename: string) => {
@@ -20585,9 +20591,16 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
         if (path === opts.blockPath) throw new ExfilBlockedError(`blocked ${filename}`)
         return new Uint8Array([path.length])
       },
-      uploadPrivate: async (files: Array<{ bytes: Uint8Array; filename: string }>) => {
+      uploadMany: async (
+        files: Array<{ bytes: Uint8Array; filename: string }>,
+        dest: { channelId: string; threadTs?: string },
+      ) => {
         calls.push('upload')
-        uploads.push(files.map((f) => ({ filename: f.filename, bytes: Array.from(f.bytes) })))
+        uploads.push({
+          target: dest,
+          files: files.map((f) => ({ filename: f.filename, bytes: Array.from(f.bytes) })),
+        })
+        if (opts.uploadErr) throw opts.uploadErr
         return opts.ids ?? files.map((_, i) => `F${i + 1}`)
       },
       fileInfo: async (id: string) => {
@@ -20617,21 +20630,24 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls } = fakeDeps()
     const blocks = [{ type: 'image', slack_file: { id: 'F_OLD' }, alt_text: 'x' }]
-    expect(await resolvePrivateImageBlocks(blocks, deps)).toBe(blocks)
+    expect(await resolvePrivateImageBlocks(blocks, deps, target)).toBe(blocks)
     expect(calls).toEqual([])
   })
 
-  test('guards every file first, uploads once privately in order, swaps in ids, dedups paths', async () => {
+  test('guards every file first, uploads once to card channel+thread in order, swaps in ids, dedups paths', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls, uploads } = fakeDeps()
     const input = card()
-    const out = await resolvePrivateImageBlocks(input, deps)
+    const out = await resolvePrivateImageBlocks(input, deps, target)
     expect(calls).toEqual(['guard:one.png', 'guard:two.png', 'upload', 'info:F1', 'info:F2'])
     expect(uploads).toEqual([
-      [
-        { filename: 'one.png', bytes: [10] },
-        { filename: 'two.png', bytes: [10] },
-      ],
+      {
+        target,
+        files: [
+          { filename: 'one.png', bytes: [10] },
+          { filename: 'two.png', bytes: [10] },
+        ],
+      },
     ])
     expect(out[1]).toEqual({ type: 'image', slack_file: { id: 'F1' }, alt_text: 'one' })
     expect(out[2]).toEqual({ type: 'image', slack_file: { id: 'F2' }, alt_text: 'two' })
@@ -20647,8 +20663,26 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
   test('a blocked file uploads nothing and the error propagates', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls } = fakeDeps({ blockPath: '/r/two.png' })
-    await expect(resolvePrivateImageBlocks(card(), deps)).rejects.toBeInstanceOf(ExfilBlockedError)
+    await expect(resolvePrivateImageBlocks(card(), deps, target)).rejects.toBeInstanceOf(
+      ExfilBlockedError,
+    )
     expect(calls).toEqual(['guard:one.png', 'guard:two.png'])
+  })
+
+  test('an upload failure propagates without polling, so the card is never posted', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const { deps, calls } = fakeDeps({ uploadErr: new Error('not_in_channel') })
+    await expect(resolvePrivateImageBlocks(card(), deps, target)).rejects.toThrow(/not_in_channel/)
+    expect(calls).toEqual(['guard:one.png', 'guard:two.png', 'upload'])
+  })
+
+  test('missing channelId fails before reading or uploading anything', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const { deps, calls } = fakeDeps()
+    await expect(resolvePrivateImageBlocks(card(), deps, { channelId: '' })).rejects.toThrow(
+      /channelId/,
+    )
+    expect(calls).toEqual([])
   })
 
   test('waits with backoff until Slack has processed the file, then returns', async () => {
@@ -20657,7 +20691,7 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     const spec: Array<Record<string, unknown>> = [
       { type: 'image', slack_file: { path: '/r/one.png' }, alt_text: 'x' },
     ]
-    const out = await resolvePrivateImageBlocks(spec, deps)
+    const out = await resolvePrivateImageBlocks(spec, deps, target)
     expect(calls.filter((c) => c.startsWith('info:'))).toHaveLength(3)
     expect(sleeps).toEqual([250, 500])
     expect(out[0]).toEqual({ type: 'image', slack_file: { id: 'F1' }, alt_text: 'x' })
@@ -20669,6 +20703,7 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     await resolvePrivateImageBlocks(
       [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
       deps,
+      target,
     )
     expect(sleeps).toEqual([250])
   })
@@ -20680,6 +20715,7 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
       resolvePrivateImageBlocks(
         [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
         deps,
+        target,
         {
           pollDelaysMs: [100, 200],
           maxWaitMs: 700,
@@ -20696,25 +20732,31 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
       resolvePrivateImageBlocks(
         [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
         deps,
+        target,
       ),
     ).rejects.toThrow(/no file id for a\.png/)
   })
 })
 
-describe('private inline images — createPrivateImageDeps (Slack adapter)', () => {
-  function make(opts: { sendableErr?: Error; contentErr?: Error } = {}) {
+describe('inline card images — createPrivateImageDeps (Slack adapter)', () => {
+  function make(
+    opts: { sendableErr?: Error; contentErr?: Error; uploadErr?: Error; ready?: boolean } = {},
+  ) {
     const uploadCalls: Array<Record<string, unknown>> = []
     const infoCalls: string[] = []
     const journaled: string[] = []
     const client = {
       filesUploadV2: async (args: Record<string, unknown>) => {
         uploadCalls.push(args)
+        if (opts.uploadErr) throw opts.uploadErr
         return { ok: true, files: [{ ok: true, files: [{ id: 'F_A' }, { id: 'F_B' }] }] }
       },
       files: {
         info: async (args: { file: string }) => {
           infoCalls.push(args.file)
-          return { file: { id: args.file, original_w: 5 } }
+          return {
+            file: opts.ready === false ? { id: args.file } : { id: args.file, original_w: 5 },
+          }
         },
       },
     }
@@ -20732,24 +20774,73 @@ describe('private inline images — createPrivateImageDeps (Slack adapter)', () 
         },
         journalExfilBlock: (r) => journaled.push(r),
         readFile: () => new Uint8Array([1, 2]),
+        sleep: async () => {},
       }),
     }
   }
 
-  test('uploadPrivate: ONE call, files in order, and NO channel / thread (never shared)', async () => {
+  test('uploadMany: ONE call, files in order, carries channel_id + thread_ts of the card', async () => {
     const { deps, uploadCalls } = make()
-    const ids = await deps.uploadPrivate([
-      { bytes: new Uint8Array([1]), filename: 'a.png' },
-      { bytes: new Uint8Array([2]), filename: 'b.png' },
-    ])
+    const ids = await deps.uploadMany(
+      [
+        { bytes: new Uint8Array([1]), filename: 'a.png' },
+        { bytes: new Uint8Array([2]), filename: 'b.png' },
+      ],
+      { channelId: 'C_CARD', threadTs: '1700000000.000100' },
+    )
     expect(ids).toEqual(['F_A', 'F_B'])
     expect(uploadCalls).toHaveLength(1)
     const call = uploadCalls[0] as Record<string, unknown>
-    expect(Object.keys(call)).toEqual(['file_uploads'])
+    expect(call.channel_id).toBe('C_CARD')
+    expect(call.thread_ts).toBe('1700000000.000100')
     expect((call.file_uploads as Array<{ filename: string }>).map((f) => f.filename)).toEqual([
       'a.png',
       'b.png',
     ])
+  })
+
+  test('uploadMany: top-level card (no threadTs) sets channel_id and omits thread_ts', async () => {
+    const { deps, uploadCalls } = make()
+    const ids = await deps.uploadMany([{ bytes: new Uint8Array([1]), filename: 'a.png' }], {
+      channelId: 'C_CARD',
+    })
+    expect(ids).toEqual(['F_A'])
+    expect(uploadCalls).toHaveLength(1)
+    const call = uploadCalls[0] as Record<string, unknown>
+    expect(call.channel_id).toBe('C_CARD')
+    expect('thread_ts' in call).toBe(false)
+  })
+
+  test('uploadMany: rejects empty channelId without calling filesUploadV2', async () => {
+    const { deps, uploadCalls } = make()
+    await expect(
+      deps.uploadMany([{ bytes: new Uint8Array([1]), filename: 'a.png' }], { channelId: '' }),
+    ).rejects.toThrow(/channelId/)
+    expect(uploadCalls).toHaveLength(0)
+  })
+
+  test('end-to-end: upload/processing failure rejects before any card post runs', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    let posted = false
+    const postCard = async (deps: ReturnType<typeof createPrivateImageDeps>) => {
+      const blocks = await resolvePrivateImageBlocks(
+        [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
+        deps,
+        { channelId: 'C_CARD', threadTs: '1700000000.000100' },
+        { pollDelaysMs: [10], maxWaitMs: 25 },
+      )
+      posted = true
+      return blocks
+    }
+    const failUpload = make({ uploadErr: new Error('channel_not_found') })
+    await expect(postCard(failUpload.deps)).rejects.toThrow(/channel_not_found/)
+    expect(posted).toBe(false)
+    expect(failUpload.uploadCalls[0]?.channel_id).toBe('C_CARD')
+    expect(failUpload.uploadCalls[0]?.thread_ts).toBe('1700000000.000100')
+
+    const failReady = make({ ready: false })
+    await expect(postCard(failReady.deps)).rejects.toThrow(/not processed by Slack/)
+    expect(posted).toBe(false)
   })
 
   test('readAndGuard: a path block or a secret in the bytes is journaled and thrown', async () => {
@@ -20834,18 +20925,28 @@ describe('ordered multi-file reply — Slack adapter', () => {
     expect(body).toContain('file_uploads: uploads')
   })
 
-  test('reply and edit_message resolve local-path images after the reserved-id check', () => {
+  test('reply and edit_message resolve local-path images with card channel+thread after the reserved-id check', () => {
     const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-    for (const [fn, tool] of [
-      ['async function executeReply(', 'reply'],
-      ['async function executeEditMessage(', 'edit_message'],
+    for (const [fn, callPattern, postPattern] of [
+      [
+        'async function executeReply(',
+        /blocks = await resolveCardImages\(\s*blocks,\s*'reply',\s*\{\s*channelId: chatId,\s*threadTs\s*\},\s*ctx,?\s*\)/,
+        /ctx\.web\.chat\.postMessage\(|deliverReplyDurably\(/,
+      ],
+      [
+        'async function executeEditMessage(',
+        /blocks = await resolveCardImages\(\s*blocks,\s*'edit_message',\s*\{\s*channelId: args\.chat_id,\s*threadTs: args\.thread_ts\s*\},\s*ctx,?\s*\)/,
+        /ctx\.web\.chat\.update\(/,
+      ],
     ] as const) {
       const start = src.indexOf(fn)
       const body = src.slice(start, src.indexOf('\n}\n', start))
       const reserved = body.indexOf('findReservedActionId(blocks)')
-      const resolved = body.indexOf(`blocks = await resolveCardImages(blocks, '${tool}', ctx)`)
+      const resolved = body.search(callPattern)
+      const posted = body.search(postPattern)
       expect(reserved).toBeGreaterThan(-1)
       expect(resolved).toBeGreaterThan(reserved)
+      expect(posted).toBeGreaterThan(resolved)
     }
   })
 })

@@ -1,6 +1,6 @@
 /**
  * private-image-blocks.ts — inline images in Block Kit cards from LOCAL files,
- * without sharing the file into any channel.
+ * shared into the card's channel and thread so every channel member can see them.
  *
  * A reply/edit block may carry an image element whose `slack_file` names a
  * local path instead of a Slack file id:
@@ -11,10 +11,16 @@
  * blocks, section accessories, context elements: any nested object of
  * `type: "image"`), runs the same outbound guards the reply tool's `files`
  * get (SLACK_SENDABLE_ROOTS allowlist + denylist, secret-value scan of the
- * bytes and the filename), uploads the bytes PRIVATELY (no `channel_id`, so
- * the file is never shared to a channel and posts no message of its own),
- * waits until Slack has processed each file, and returns a copy of the blocks
- * with `slack_file: { id }` in place of each path.
+ * bytes and the filename), uploads the bytes in ONE `filesUploadV2` call
+ * shared into the SAME `channel_id` (and `thread_ts`, when in a thread) as the
+ * card, waits until Slack has processed each file, and returns a copy of the
+ * blocks with `slack_file: { id }` in place of each path.
+ *
+ * Why share into the card's channel/thread: per Slack's `files.completeUploadExternal`
+ * and `slack_file` docs, omitting `channel_id` leaves the uploaded file private
+ * to the uploader (the bot), and `slack_file` image blocks are visibility-gated —
+ * viewers only see the image if they have access to the underlying file. Sharing
+ * into the card's conversation grants access to every member of that channel.
  *
  * Why the wait: Slack processes an upload asynchronously. An image block that
  * references a file Slack has not finished processing is rejected or renders
@@ -26,15 +32,26 @@
  * against fakes and imports no SDK.
  */
 
+/** Destination conversation where card images must be shared so channel
+ *  members have access to render `slack_file` image blocks. */
+export interface ImageUploadTarget {
+  channelId: string
+  threadTs?: string
+}
+
 /** Effects injected by server.ts (production) or tests (fakes). */
 export interface PrivateImageDeps {
   /** Read `path` ONCE, run the outbound file guards on those bytes (path
    *  allowlist/denylist + secret-value scan of content and filename) and return
    *  them. Throws on a block (the implementation journals it first). */
   readAndGuard(path: string, filename: string): Uint8Array
-  /** Upload the files in ONE call WITHOUT a channel (private, unshared) and
-   *  return their Slack file ids in the given order. */
-  uploadPrivate(files: Array<{ bytes: Uint8Array; filename: string }>): Promise<string[]>
+  /** Upload all card images in ONE call shared into `target.channelId` (and
+   *  `target.threadTs` when in a thread) and return their Slack file ids in the
+   *  given order. */
+  uploadMany(
+    files: Array<{ bytes: Uint8Array; filename: string }>,
+    target: ImageUploadTarget,
+  ): Promise<string[]>
   /** `files.info` for one id → the `file` object (or undefined). */
   fileInfo(id: string): Promise<Record<string, unknown> | undefined>
   sleep(ms: number): Promise<void>
@@ -83,7 +100,9 @@ export function findLocalImageRefs(blocks: unknown): ImageRef[] {
         throw new Error('image slack_file takes ONE of path, id or url')
       }
       if (!IMAGE_EXT_RE.test(path)) {
-        throw new Error(`image slack_file.path must be a .png, .jpg, .jpeg or .gif file: ${basenameOf(path)}`)
+        throw new Error(
+          `image slack_file.path must be a .png, .jpg, .jpeg or .gif file: ${basenameOf(path)}`,
+        )
       }
       refs.push({ node, path })
     }
@@ -100,7 +119,11 @@ export function isImageReady(file: Record<string, unknown> | undefined): boolean
   return Object.keys(file).some((k) => k.startsWith('thumb_') && typeof file[k] === 'string')
 }
 
-async function waitUntilReady(id: string, deps: PrivateImageDeps, opts: ResolveOptions): Promise<void> {
+async function waitUntilReady(
+  id: string,
+  deps: PrivateImageDeps,
+  opts: ResolveOptions,
+): Promise<void> {
   const delays = opts.pollDelaysMs ?? DEFAULT_POLL_DELAYS_MS
   const budget = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS
   let waited = 0
@@ -123,17 +146,21 @@ async function waitUntilReady(id: string, deps: PrivateImageDeps, opts: ResolveO
   }
 }
 
-/** Upload every local-path image privately, wait until Slack can render each,
- *  and return a deep copy of `blocks` with `slack_file: { id }` in their place.
- *  Blocks without local-path images are returned unchanged (same reference).
- *  The same path used twice uploads once. Nothing is uploaded if any guard
- *  blocks. */
+/** Upload every local-path image into the card's channel/thread in one batch,
+ *  wait until Slack can render each, and return a deep copy of `blocks` with
+ *  `slack_file: { id }` in their place. Blocks without local-path images are
+ *  returned unchanged (same reference). The same path used twice uploads once.
+ *  Nothing is uploaded if any guard blocks. */
 export async function resolvePrivateImageBlocks<T>(
   blocks: T,
   deps: PrivateImageDeps,
+  target: ImageUploadTarget,
   opts: ResolveOptions = {},
 ): Promise<T> {
   if (findLocalImageRefs(blocks).length === 0) return blocks
+  if (!target.channelId) {
+    throw new Error('inline image upload requires a channelId so channel members can view it')
+  }
   const copy = structuredClone(blocks)
   const refs = findLocalImageRefs(copy)
   const paths = [...new Set(refs.map((r) => r.path))]
@@ -142,11 +169,11 @@ export async function resolvePrivateImageBlocks<T>(
     const filename = basenameOf(path)
     return { bytes: deps.readAndGuard(path, filename), filename }
   })
-  const ids = await deps.uploadPrivate(files)
+  const ids = await deps.uploadMany(files, target)
   const idByPath = new Map<string, string>()
   for (const [i, path] of paths.entries()) {
     const id = ids[i]
-    if (!id) throw new Error(`private upload returned no file id for ${basenameOf(path)}`)
+    if (!id) throw new Error(`image upload returned no file id for ${basenameOf(path)}`)
     idByPath.set(path, id)
   }
   for (const id of idByPath.values()) await waitUntilReady(id, deps, opts)
@@ -187,12 +214,18 @@ export function createPrivateImageDeps(deps: {
       guarded(() => deps.assertNoSecretValues(filename))
       return bytes
     },
-    async uploadPrivate(files) {
-      // No channel_id / channels / thread_ts: the files stay private to the bot
-      // and post no message; the card's image block is their only appearance.
-      const res = await deps.client.filesUploadV2({
+    async uploadMany(files, target) {
+      if (!target.channelId) {
+        throw new Error('inline image upload requires a channelId so channel members can view it')
+      }
+      // Share into the card's channel (and thread, when present) in ONE call so
+      // every member of the conversation can view the `slack_file` image blocks.
+      const uploadArgs: Record<string, unknown> = {
+        channel_id: target.channelId,
         file_uploads: files.map((f) => ({ file: Buffer.from(f.bytes), filename: f.filename })),
-      })
+      }
+      if (target.threadTs) uploadArgs.thread_ts = target.threadTs
+      const res = await deps.client.filesUploadV2(uploadArgs)
       const r = res as { files?: Array<{ id?: string; files?: Array<{ id?: string }> }> }
       const ids = (r.files ?? []).flatMap((c) =>
         c.files ? c.files.map((f) => f.id ?? '') : [c.id ?? ''],

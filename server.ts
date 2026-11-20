@@ -115,7 +115,11 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
-import { createPrivateImageDeps, resolvePrivateImageBlocks } from './private-image-blocks.ts'
+import {
+  createPrivateImageDeps,
+  type ImageUploadTarget,
+  resolvePrivateImageBlocks,
+} from './private-image-blocks.ts'
 import {
   beginDurableStream,
   createDeliverySendDeps,
@@ -1005,7 +1009,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'object' },
             description:
-              'Slack Block Kit blocks for rich layouts (optional). Sent as a single message. Buttons in an actions block are LIVE: a user click is delivered back to you as an inbound message of the form [button click] "<label>" (value: <value>) with structured meta, so you can offer tappable choices and react to them. Give each button a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is uploaded privately (never shared to the channel), must pass the same path checks as files, and the card posts only once Slack has processed the image.',
+              'Slack Block Kit blocks for rich layouts (optional). Sent as a single message. Buttons in an actions block are LIVE: a user click is delivered back to you as an inbound message of the form [button click] "<label>" (value: <value>) with structured meta, so you can offer tappable choices and react to them. Give each button a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is shared into the same channel/thread in one batch before the card posts (so channel members can view the image), must pass the same path checks as files, and the card posts only once Slack has processed the image.',
           },
           thread_ts: {
             type: 'string',
@@ -1051,11 +1055,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               'New message text (mrkdwn supported). When blocks is also set, text is the notification fallback only.',
           },
+          thread_ts: {
+            type: 'string',
+            description:
+              'Parent thread timestamp when editing a message in a thread (optional; used for outbound thread gating and to share inline local images into the same thread)',
+          },
           blocks: {
             type: 'array',
             items: { type: 'object' },
             description:
-              'Slack Block Kit blocks for the edited message (optional). Slack replaces the message wholesale on edit, so a message that was sent WITH blocks must be edited WITH blocks — editing it with text alone deletes its layout and buttons. Pass the full desired block list, not a delta. Buttons stay LIVE after the edit; give each a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is uploaded privately (never shared to the channel), must pass the same path checks as files, and the card posts only once Slack has processed the image.',
+              'Slack Block Kit blocks for the edited message (optional). Slack replaces the message wholesale on edit, so a message that was sent WITH blocks must be edited WITH blocks — editing it with text alone deletes its layout and buttons. Pass the full desired block list, not a delta. Buttons stay LIVE after the edit; give each a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is shared into the same channel/thread in one batch before the edit applies (so channel members can view the image), must pass the same path checks as files, and the edit applies only once Slack has processed the image.',
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -1199,11 +1208,17 @@ function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolC
   }
 }
 
-/** Swap local-path image elements (`slack_file: { path }`) for privately
- *  uploaded Slack files (`slack_file: { id }`), guarded like reply files and
- *  only once Slack can render them. Returns the blocks unchanged when none
- *  carry a local path. See private-image-blocks.ts. */
-function resolveCardImages<T>(blocks: T, toolName: string, ctx: ToolContext): Promise<T> {
+/** Swap local-path image elements (`slack_file: { path }`) for Slack files
+ *  (`slack_file: { id }`) shared into the card's channel/thread so channel
+ *  members can view them, guarded like reply files and only once Slack can
+ *  render them. Returns the blocks unchanged when none carry a local path.
+ *  See private-image-blocks.ts. */
+function resolveCardImages<T>(
+  blocks: T,
+  toolName: string,
+  target: ImageUploadTarget,
+  ctx: ToolContext,
+): Promise<T> {
   return resolvePrivateImageBlocks(
     blocks,
     createPrivateImageDeps({
@@ -1214,6 +1229,7 @@ function resolveCardImages<T>(blocks: T, toolName: string, ctx: ToolContext): Pr
         ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName, reason }),
       readFile: (p) => readFileSync(resolve(p)),
     }),
+    target,
   )
 }
 
@@ -1647,10 +1663,10 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
         `reply: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
       )
     }
-    // Local-path images → private uploads (after every reject above, so a
-    // refused reply uploads nothing; before record/send, so a durable
+    // Local-path images → channel/thread uploads (after every reject above, so
+    // a refused reply uploads nothing; before record/send, so a durable
     // obligation stores file ids and redelivery never re-uploads).
-    blocks = await resolveCardImages(blocks, 'reply', ctx)
+    blocks = await resolveCardImages(blocks, 'reply', { channelId: chatId, threadTs }, ctx)
   }
 
   const access = ctx.getAccess()
@@ -1828,7 +1844,12 @@ async function executeEditMessage(
         `edit_message: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
       )
     }
-    blocks = await resolveCardImages(blocks, 'edit_message', ctx)
+    blocks = await resolveCardImages(
+      blocks,
+      'edit_message',
+      { channelId: args.chat_id, threadTs: args.thread_ts },
+      ctx,
+    )
   }
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
