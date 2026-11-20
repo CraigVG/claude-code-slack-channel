@@ -123,6 +123,48 @@ async function waitUntilReady(id: string, deps: PrivateImageDeps, opts: ResolveO
   }
 }
 
+/** True for a reply `files` path Slack can show inline in an image block
+ *  (png/jpg/jpeg/gif). Everything else keeps the ordinary file share. */
+export function isInlineImagePath(path: string): boolean {
+  return IMAGE_EXT_RE.test(path)
+}
+
+/** Split reply `files` into inline images and everything else, each in the
+ *  order given. An image never goes to both. */
+export function splitReplyFiles(files: readonly string[] | undefined): {
+  images: string[]
+  others: string[]
+} {
+  const images: string[] = []
+  const others: string[] = []
+  for (const f of files ?? []) (isInlineImagePath(f) ? images : others).push(f)
+  return { images, others }
+}
+
+/** Slack allows at most 50 blocks per message. */
+export const MAX_IMAGE_BLOCKS_PER_MESSAGE = 50
+
+/** One image block per ABSOLUTE path, alt text from the file name, in the
+ *  order given. The blocks carry `slack_file: { path }`, so
+ *  `resolvePrivateImageBlocks` guards, uploads privately and swaps in the
+ *  file ids. */
+export function replyImageBlocks(absPaths: readonly string[]): Array<Record<string, unknown>> {
+  return absPaths.map((path) => ({
+    type: 'image',
+    slack_file: { path },
+    alt_text: basenameOf(path).slice(0, 2000) || 'image',
+  }))
+}
+
+/** Split blocks into messages of at most `MAX_IMAGE_BLOCKS_PER_MESSAGE`. */
+export function chunkImageBlocks<T>(blocks: readonly T[]): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < blocks.length; i += MAX_IMAGE_BLOCKS_PER_MESSAGE) {
+    out.push(blocks.slice(i, i + MAX_IMAGE_BLOCKS_PER_MESSAGE))
+  }
+  return out
+}
+
 /** Upload every local-path image privately, wait until Slack can render each,
  *  and return a deep copy of `blocks` with `slack_file: { id }` in their place.
  *  Blocks without local-path images are returned unchanged (same reference).
