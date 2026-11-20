@@ -20,7 +20,7 @@
  * log files keep their meanings.
  */
 
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import type { SessionKey } from './lib.ts'
 import type { SessionSupervisor } from './supervisor.ts'
 

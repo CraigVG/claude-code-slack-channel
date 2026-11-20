@@ -12,7 +12,7 @@ import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import {
   DEFAULT_CHANNEL_CIRCUIT_BREAKER,
   DEFAULT_PEER_BOT_RATE_LIMIT,
@@ -617,7 +617,7 @@ export const SessionSchema = z
     createdAt: z.number(),
     lastActiveAt: z.number(),
     ownerId: z.string(),
-    data: z.record(z.string(), z.unknown()),
+    data: z.record(z.unknown()),
     // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
     // session files (written before this field existed) still validate under
     // the outer `.strict()`.

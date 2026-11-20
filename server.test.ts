@@ -15,7 +15,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import {
   type Access,
   AUDIT_RECEIPTS_MAX,
@@ -3560,6 +3560,17 @@ describe('PolicyRule schema (29-A.1)', () => {
     expect(parsed.priority).toBe(100)
   })
 
+  test('priority accepts any integer, including beyond the safe-integer range', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    const parsed = PolicyRule.parse({
+      id: 'r1',
+      effect: 'auto_approve',
+      match: { tool: 'reply' },
+      priority: 2 ** 53 + 2,
+    }) as { priority: number }
+    expect(parsed.priority).toBe(2 ** 53 + 2)
+  })
+
   // ── Loader-deferred invariants ────────────────────────────────────────
 
   test('parsePolicyRules does NOT enforce id uniqueness (deferred to loader per design doc)', async () => {
@@ -4880,6 +4891,18 @@ describe('extractManifests (31-A.2)', () => {
     expect(m).toBeDefined()
     expect(m?.name).toBe('Solo Bot')
     expect(m?.__claude_bot_manifest_v1__).toBe(true)
+  })
+
+  test('accepts minute-precision publishedAt and keeps endpoint strings verbatim', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    const [m] = extractManifests([
+      validManifestJson({
+        publishedAt: '2026-01-01T00:00Z',
+        agentCard: { endpoints: ['  https://a.example/x  '] },
+      }),
+    ])
+    expect(m?.publishedAt).toBe('2026-01-01T00:00Z')
+    expect(m?.agentCard?.endpoints).toEqual(['  https://a.example/x  '])
   })
 
   test('preserves input order across a mix of valid and invalid entries', async () => {
@@ -14657,6 +14680,27 @@ describe('mapAcpSessionCancel (ccsc-21x)', () => {
   // -------------------------------------------------------------------------
   // Envelope validation — -32600 Invalid Request
   // -------------------------------------------------------------------------
+
+  test('Invalid Request carries the v1 issue payload shape', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      { jsonrpc: '2.0', id: 1, method: 'session/cancel', params: { sessionId: 'ab' } },
+      sup,
+    )
+    expect('error' in resp && resp.error.data).toEqual({
+      issues: [
+        {
+          code: 'too_small',
+          minimum: 3,
+          type: 'string',
+          inclusive: true,
+          exact: false,
+          message: 'String must contain at least 3 character(s)',
+          path: ['params', 'sessionId'],
+        },
+      ],
+    })
+  })
 
   test('missing jsonrpc field → -32600 Invalid Request', async () => {
     const sup = createSessionSupervisor({ stateRoot: stateDir })

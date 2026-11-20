@@ -20,7 +20,7 @@
 import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { canonicalJson } from './journal.ts'
 
 // ---------------------------------------------------------------------------
