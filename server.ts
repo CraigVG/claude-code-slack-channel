@@ -113,6 +113,7 @@ import {
   DEFAULT_CHANNEL_CIRCUIT_BREAKER,
   DEFAULT_PEER_BOT_RATE_LIMIT,
 } from './peer-bot-rate-limit.ts'
+import { pinnedHttpsGet } from './pinned-https.ts'
 import {
   type ApprovalKey,
   approvalKey,
@@ -130,6 +131,7 @@ import {
   createPrivateImageDeps,
   planImageReply,
   resolvePrivateImageBlocks,
+  toAbsoluteUnnormalized,
 } from './private-image-blocks.ts'
 import {
   beginDurableStream,
@@ -1720,6 +1722,25 @@ async function executeReplyFileDurablePath(opts: {
   }
 }
 
+/** Run the outbound file guard on every reply file path EXACTLY as the caller
+ *  gave it, journaling a block. `assertSendable` rejects a raw `..` component
+ *  before it resolves anything, so this must see the unnormalized input. */
+function preflightReplyFilePaths(files: readonly string[] | undefined, ctx: ToolContext): void {
+  for (const filePath of files ?? []) {
+    try {
+      ctx.assertSendable(filePath)
+    } catch (exfilErr) {
+      ctx.journalWrite({
+        kind: 'exfil.block',
+        outcome: 'deny',
+        toolName: 'reply',
+        reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
+      })
+      throw exfilErr
+    }
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1753,7 +1774,14 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // paths, so the block guards below and resolveCardImages give them the same
   // file checks and ONE private upload before the single post. Other files
   // keep the ordinary share.
-  const plan = planImageReply(text, argFiles, blocks, (f) => resolve(f))
+  // PR #8 review P1: every reply file path is checked AS GIVEN (raw `..`
+  // components rejected, realpath allowlist + denylist) BEFORE any path is made
+  // absolute or any upload starts — for image and non-image files alike. The
+  // per-upload guards still run on the bytes later.
+  preflightReplyFilePaths(argFiles, ctx)
+  const plan = planImageReply(text, argFiles, blocks, (f) =>
+    toAbsoluteUnnormalized(f, process.cwd()),
+  )
   blocks = plan.blocks
   const files = plan.files
   // The value-exfiltration guard must also cover Block Kit content: a secret
@@ -2174,7 +2202,14 @@ async function downloadInboundImage(
   return fetchInboundImage(
     url,
     {
-      fetch: (u, init) => fetch(u, init),
+      // Connect only to the address vetHost just validated (no second DNS
+      // lookup); TLS still verifies the URL's hostname.
+      fetch: (u, init, pin) =>
+        pinnedHttpsGet(new URL(u), pin, {
+          headers: init.headers as Record<string, string>,
+          timeoutMs: 20_000,
+          ...(init.signal ? { signal: init.signal } : {}),
+        }),
       lookup: async (host) => (await dnsLookup(host, { all: true })).map((a) => a.address),
       botToken: ctx.botToken,
     },

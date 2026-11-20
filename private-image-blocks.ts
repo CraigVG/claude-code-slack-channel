@@ -196,6 +196,15 @@ export function composeImageReplyBlocks(
   return out
 }
 
+/** Absolute form of a reply path WITHOUT normalizing it: an absolute path is
+ *  kept byte for byte and a relative one is only prefixed with `cwd`, so any
+ *  `..` survives into the image block and the per-upload `assertSendable`
+ *  (which rejects a raw `..` before resolving) still sees it. `path.resolve`
+ *  would collapse it (PR #8 review P1). */
+export function toAbsoluteUnnormalized(path: string, cwd: string): string {
+  return path.startsWith('/') ? path : `${cwd.replace(/\/+$/, '')}/${path}`
+}
+
 /** What the reply tool sends for `text` + `files` + optional `blocks`: with
  *  any png/jpg/gif file, ONE blocks message (`composeImageReplyBlocks`) and
  *  only the non-image files left to share; otherwise everything unchanged.

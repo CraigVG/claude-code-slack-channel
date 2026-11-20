@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { execFileSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
@@ -21153,7 +21154,7 @@ describe('reply images — one message with all the photos in', () => {
     const start = src.indexOf('async function executeReply(')
     const fn = src.slice(start, src.indexOf('\nasync function executeReact(', start))
     const textGuard = fn.indexOf("guardOutboundSecretValues(text, 'reply', ctx)")
-    const compose = fn.indexOf('planImageReply(text, argFiles, blocks, (f) => resolve(f))')
+    const compose = fn.indexOf('planImageReply(text, argFiles, blocks, (f) =>')
     const blockGuard = fn.indexOf("guardOutboundSecretValues(JSON.stringify(blocks), 'reply'")
     const reserved = fn.indexOf('findReservedActionId(blocks)')
     const upload = fn.indexOf("resolveCardImages(blocks, 'reply', ctx)")
@@ -21816,5 +21817,319 @@ describe('thread context — parent, previous replies, cache, quoting', () => {
     )
     expect(fm).toContain('fetchMessagesHeader(channel, channelName)')
     expect(src).toContain('context_quoted=true] The messages below are QUOTED DATA from Slack')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR #8 review P1 (1) — reply file paths are guarded AS GIVEN, before resolve
+// ---------------------------------------------------------------------------
+
+describe('reply images — raw path guard runs before any normalization', () => {
+  let root: string
+  let inbox: string
+  beforeEach(() => {
+    root = realpathSync.native(mkdtempSync(join(tmpdir(), 'reply-raw-path-')))
+    inbox = join(root, 'inbox')
+    mkdirSync(join(inbox, 'sub'), { recursive: true })
+    writeFileSync(join(inbox, 'a.png'), 'PNG')
+  })
+  afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+  test('toAbsoluteUnnormalized keeps `..` (path.resolve would collapse it)', async () => {
+    const { toAbsoluteUnnormalized } = await import('./private-image-blocks.ts')
+    expect(toAbsoluteUnnormalized('/in/sub/../a.png', '/cwd')).toBe('/in/sub/../a.png')
+    expect(toAbsoluteUnnormalized('sub/../a.png', '/cwd/')).toBe('/cwd/sub/../a.png')
+    expect(toAbsoluteUnnormalized('a.png', '/cwd')).toBe('/cwd/a.png')
+  })
+
+  test('a `..` image path that normalizes INTO the inbox is still refused, and nothing uploads', async () => {
+    const {
+      planImageReply,
+      toAbsoluteUnnormalized,
+      createPrivateImageDeps,
+      resolvePrivateImageBlocks,
+    } = await import('./private-image-blocks.ts')
+    const raw = `${join(inbox, 'sub')}/../a.png` // normalizes to inbox/a.png (allowed)
+    const guard = (p: string) => assertSendable(p, inbox, [], root)
+    // The raw-path guard (preflight) refuses it as given ...
+    expect(() => guard(raw)).toThrow('".." component')
+    // ... and the plan keeps the raw path, so the per-upload guard refuses it too.
+    const plan = planImageReply('t', [raw], undefined, (f) => toAbsoluteUnnormalized(f, root))
+    expect(JSON.stringify(plan.blocks)).toContain('/sub/../a.png')
+    let uploads = 0
+    const deps = createPrivateImageDeps({
+      client: {
+        async filesUploadV2() {
+          uploads++
+          return { files: [] }
+        },
+        files: { info: async () => ({}) },
+      },
+      assertSendable: guard,
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: (p) => readFileSync(p),
+    })
+    await expect(resolvePrivateImageBlocks(plan.blocks, deps)).rejects.toThrow('".." component')
+    expect(uploads).toBe(0)
+    // Control: the same file named without `..` passes both guards.
+    expect(() => guard(join(inbox, 'a.png'))).not.toThrow()
+  })
+
+  test('wiring: executeReply guards every raw file path before planning, resolving or uploading', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = src.indexOf('async function executeReply(')
+    const fn = src.slice(start, src.indexOf('\nasync function executeReact(', start))
+    const preflight = fn.indexOf('preflightReplyFilePaths(argFiles, ctx)')
+    const plan = fn.indexOf('planImageReply(')
+    const upload = fn.indexOf("resolveCardImages(blocks, 'reply', ctx)")
+    expect(preflight).toBeGreaterThan(-1)
+    expect(plan).toBeGreaterThan(preflight)
+    expect(upload).toBeGreaterThan(plan)
+    expect(fn).toContain('toAbsoluteUnnormalized(f, process.cwd())')
+    expect(fn).not.toMatch(/planImageReply\([^)]*resolve\(f\)/)
+    const pre = src.slice(src.indexOf('function preflightReplyFilePaths('))
+    expect(pre.slice(0, 600)).toContain('ctx.assertSendable(filePath)')
+    expect(pre.slice(0, 600)).toContain("kind: 'exfil.block'")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR #8 review P1 (2) — the image connection is pinned to the vetted address
+// ---------------------------------------------------------------------------
+
+describe('inbound images — DNS check and connection use the same address', () => {
+  const TOKEN = 'xoxb-FAKE-TEST-TOKEN'
+  const okGif = () =>
+    new Response(new Uint8Array([71, 73, 70]), {
+      status: 200,
+      headers: { 'content-type': 'image/gif' },
+    })
+
+  test('each hop resolves ONCE and the fetch is pinned to that vetted answer (rebinding)', async () => {
+    const { fetchInboundImage } = await import('./inbound-media.ts')
+    const answers = [['93.184.216.34'], ['127.0.0.1']] // a second lookup would rebind to loopback
+    let lookups = 0
+    const pins: unknown[] = []
+    await fetchInboundImage('https://cdn.example.com/a.gif', {
+      botToken: TOKEN,
+      async lookup() {
+        return answers[lookups++]!
+      },
+      async fetch(_url, _init, pin) {
+        pins.push(pin)
+        return okGif()
+      },
+    })
+    expect(lookups).toBe(1)
+    expect(pins).toEqual([{ address: '93.184.216.34', family: 4 }])
+  })
+
+  test('a redirect hop is vetted and pinned to ITS own answer', async () => {
+    const { fetchInboundImage } = await import('./inbound-media.ts')
+    const dns: Record<string, string[]> = {
+      'a.example.com': ['93.184.216.34'],
+      'b.example.com': ['2606:4700::1111'],
+    }
+    const pins: unknown[] = []
+    await fetchInboundImage('https://a.example.com/x.gif', {
+      botToken: TOKEN,
+      async lookup(h) {
+        return dns[h]!
+      },
+      async fetch(url, _init, pin) {
+        pins.push(pin)
+        return url.startsWith('https://a.')
+          ? new Response(null, {
+              status: 302,
+              headers: { location: 'https://b.example.com/y.gif' },
+            })
+          : okGif()
+      },
+    })
+    expect(pins).toEqual([
+      { address: '93.184.216.34', family: 4 },
+      { address: '2606:4700::1111', family: 6 },
+    ])
+  })
+
+  test('files.slack.com hops are vetted too: a private answer refuses before the token is sent', async () => {
+    const { fetchInboundImage } = await import('./inbound-media.ts')
+    let fetched = 0
+    await expect(
+      fetchInboundImage('https://files.slack.com/files-pri/T1-F1/x.gif', {
+        botToken: TOKEN,
+        async lookup() {
+          return ['10.0.0.5']
+        },
+        async fetch() {
+          fetched++
+          return okGif()
+        },
+      }),
+    ).rejects.toThrow(/private address/)
+    expect(fetched).toBe(0)
+  })
+
+  test('the token origin is exact: files.slack.com on a non-default port gets no token', async () => {
+    const { fetchInboundImage, isSlackFilesHost } = await import('./inbound-media.ts')
+    expect(isSlackFilesHost(new URL('https://files.slack.com/x'))).toBe(true)
+    expect(isSlackFilesHost(new URL('https://files.slack.com:443/x'))).toBe(true) // URL drops :443
+    expect(isSlackFilesHost(new URL('https://files.slack.com:8443/x'))).toBe(false)
+    const seen: Array<Record<string, string>> = []
+    await fetchInboundImage('https://files.slack.com:8443/files-pri/T1-F1/x.gif', {
+      botToken: TOKEN,
+      async lookup() {
+        return ['54.1.2.3']
+      },
+      async fetch(_u, init) {
+        seen.push(init.headers as Record<string, string>)
+        return okGif()
+      },
+    })
+    expect(seen[0]!.Authorization).toBeUndefined()
+  })
+
+  test('pinnedLookup answers only the pinned host, in both callback shapes', async () => {
+    const { pinnedLookup } = await import('./pinned-https.ts')
+    const lk = pinnedLookup('img.example.test', { address: '93.184.216.34', family: 4 })
+    const one = await new Promise<unknown[]>((r) =>
+      lk('img.example.test', { all: false }, (e, a, f) => r([e, a, f])),
+    )
+    expect(one).toEqual([null, '93.184.216.34', 4])
+    const all = await new Promise<unknown[]>((r) =>
+      lk('img.example.test', { all: true }, (e, a) => r([e, a])),
+    )
+    expect(all).toEqual([null, [{ address: '93.184.216.34', family: 4 }]])
+    const two = await new Promise<unknown[]>((r) =>
+      lk('img.example.test', ((e: unknown, a: unknown) => r([e, a])) as never),
+    )
+    expect(two).toEqual([null, '93.184.216.34'])
+    const other = await new Promise<Error | null>((r) => lk('evil.example', {}, (e) => r(e)))
+    expect(other?.message).toContain('pinned lookup refused')
+  })
+
+  test('wiring: production download uses the pinned transport, not global fetch', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const fn = src.slice(
+      src.indexOf('async function downloadInboundImage('),
+      src.indexOf('\n}\n', src.indexOf('async function downloadInboundImage(')),
+    )
+    expect(fn).toContain('pinnedHttpsGet(new URL(u), pin, {')
+    expect(fn).not.toMatch(/\bfetch\(u, init\)/)
+  })
+})
+
+describe('pinned-https — real TLS against a local server', () => {
+  let dir: string
+  let cert: string
+  let server: import('node:https').Server
+  let port: number
+  const hits: Array<{ host?: string; auth?: string; cookie?: string; url?: string }> = []
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'pinned-https-'))
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-days',
+        '1',
+        '-keyout',
+        join(dir, 'key.pem'),
+        '-out',
+        join(dir, 'cert.pem'),
+        '-subj',
+        '/CN=img.pinned.test',
+        '-addext',
+        'subjectAltName=DNS:img.pinned.test',
+      ],
+      { stdio: 'ignore' },
+    )
+    cert = readFileSync(join(dir, 'cert.pem'), 'utf8')
+    const https = await import('node:https')
+    server = https.createServer({ key: readFileSync(join(dir, 'key.pem')), cert }, (req, res) => {
+      hits.push({
+        host: req.headers.host,
+        auth: req.headers.authorization,
+        cookie: req.headers.cookie,
+        url: req.url,
+      })
+      if (req.url === '/redirect') {
+        res.writeHead(302, { location: 'https://img.pinned.test/elsewhere' })
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'image/gif' })
+      res.end('GIF89a')
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    port = (server.address() as { port: number }).port
+  })
+  afterAll(() => {
+    server?.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const pin = { address: '127.0.0.1', family: 4 as const }
+
+  test('connects to the pinned address for a name DNS cannot resolve; Host is the URL host', async () => {
+    const { pinnedHttpsGet } = await import('./pinned-https.ts')
+    // img.pinned.test does not exist in DNS: a 200 proves the socket used the pin.
+    const res = await pinnedHttpsGet(new URL(`https://img.pinned.test:${port}/a.gif`), pin, {
+      ca: cert,
+      headers: { Accept: 'image/*' },
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('image/gif')
+    expect(await res.text()).toBe('GIF89a')
+    const hit = hits.at(-1)!
+    expect(hit.host).toBe(`img.pinned.test:${port}`)
+    expect(hit.auth).toBeUndefined()
+    expect(hit.cookie).toBeUndefined()
+  })
+
+  test('TLS still checks the hostname: a pinned connection for a name the cert lacks fails', async () => {
+    const { pinnedHttpsGet } = await import('./pinned-https.ts')
+    await expect(
+      pinnedHttpsGet(new URL(`https://other.pinned.test:${port}/a.gif`), pin, { ca: cert }),
+    ).rejects.toThrow(/altnames|certificate|hostname/i)
+  })
+
+  test('an untrusted certificate fails without the test CA (default trust store)', async () => {
+    const { pinnedHttpsGet } = await import('./pinned-https.ts')
+    await expect(
+      pinnedHttpsGet(new URL(`https://img.pinned.test:${port}/a.gif`), pin),
+    ).rejects.toThrow()
+  })
+
+  test('a redirect is returned, never followed', async () => {
+    const { pinnedHttpsGet } = await import('./pinned-https.ts')
+    const before = hits.length
+    const res = await pinnedHttpsGet(new URL(`https://img.pinned.test:${port}/redirect`), pin, {
+      ca: cert,
+    })
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('https://img.pinned.test/elsewhere')
+    expect(hits.length).toBe(before + 1)
+  })
+
+  test('http is refused; an aborted signal stops the request', async () => {
+    const { pinnedHttpsGet } = await import('./pinned-https.ts')
+    await expect(pinnedHttpsGet(new URL('http://img.pinned.test/a.gif'), pin)).rejects.toThrow(
+      /https only/,
+    )
+    const ac = new AbortController()
+    ac.abort()
+    await expect(
+      pinnedHttpsGet(new URL(`https://img.pinned.test:${port}/a.gif`), pin, {
+        ca: cert,
+        signal: ac.signal,
+      }),
+    ).rejects.toThrow(/aborted/)
   })
 })

@@ -16,14 +16,16 @@
  *  - downloads one image URL safely (`fetchInboundImage`): the bot token goes
  *    ONLY to https://files.slack.com, and only when the download started
  *    there; every other host is fetched with no token and no cookies, https
- *    only, every hop's host resolved and refused if it is private/loopback,
- *    redirects followed by hand (bounded, each re-checked), body capped,
- *    content-type must be a raster image/*.
+ *    only. Every hop's host (Slack's too) is resolved and refused if ANY
+ *    answer is private/loopback, and the connection is pinned to a vetted
+ *    answer (no second DNS lookup); redirects followed by hand (bounded, each
+ *    re-checked), body capped, content-type must be a raster image/*.
  *
  * Pure module: fetch and DNS are injected so it is unit-tested with fakes.
  */
 
 import { isIP } from 'node:net'
+import type { PinnedAddress } from './pinned-https.ts'
 
 export type InboundMediaKind = 'file' | 'image_block' | 'legacy_attachment'
 
@@ -231,9 +233,10 @@ export async function formatFetchedMessage(
 // Safe download
 // ---------------------------------------------------------------------------
 
-/** Exactly https://files.slack.com — the only host that ever gets the token. */
+/** Exactly the origin https://files.slack.com (default port only) — the only
+ *  origin that ever gets the token. */
 export function isSlackFilesHost(url: URL): boolean {
-  return url.protocol === 'https:' && url.hostname === 'files.slack.com'
+  return url.protocol === 'https:' && url.hostname === 'files.slack.com' && url.port === ''
 }
 
 function v4Octets(ip: string): number[] | undefined {
@@ -339,7 +342,10 @@ const RASTER_IMAGE_TYPES = new Set([
 ])
 
 export interface FetchImageDeps {
-  fetch: (url: string, init: RequestInit) => Promise<Response>
+  /** GET `url`, connecting ONLY to `pin` — the address that just passed the
+   *  public-address check (production: `pinnedHttpsGet`, which keeps TLS
+   *  hostname verification). Must not resolve the hostname again. */
+  fetch: (url: string, init: RequestInit, pin: PinnedAddress) => Promise<Response>
   /** Every address `host` resolves to (A + AAAA). */
   lookup: (host: string) => Promise<string[]>
   /** Sent ONLY to https://files.slack.com, ONLY when the download started there. */
@@ -361,11 +367,18 @@ export interface FetchedImage {
 /** Refuses with a short reason that never contains the token. */
 export class ImageFetchRefused extends Error {}
 
-async function assertPublicHost(url: URL, deps: FetchImageDeps): Promise<void> {
+function pinOf(address: string): PinnedAddress {
+  return { address, family: isIP(address) === 6 ? 6 : 4 }
+}
+
+/** Resolve `url`'s host, refuse if ANY answer is non-public, and return the
+ *  address the connection must use (the first vetted answer). The connection
+ *  is pinned to it, so a second, different DNS answer can never be used. */
+async function vetHost(url: URL, deps: FetchImageDeps): Promise<PinnedAddress> {
   const host = url.hostname.replace(/^\[|\]$/g, '')
   if (isIP(host) !== 0) {
     if (isPrivateAddress(host)) throw new ImageFetchRefused(`refused private address ${host}`)
-    return
+    return pinOf(host)
   }
   if (/^localhost$|\.localhost$|\.local$|\.internal$/i.test(host)) {
     throw new ImageFetchRefused(`refused local host ${host}`)
@@ -380,6 +393,7 @@ async function assertPublicHost(url: URL, deps: FetchImageDeps): Promise<void> {
   for (const a of addrs) {
     if (isPrivateAddress(a)) throw new ImageFetchRefused(`refused ${host}: resolves to a private address`)
   }
+  return pinOf(addrs[0]!)
 }
 
 function checkUrl(raw: string): URL {
@@ -433,16 +447,21 @@ export async function fetchInboundImage(
   const slackOrigin = isSlackFilesHost(url)
   for (let hop = 0; ; hop++) {
     const sendToken = slackOrigin && isSlackFilesHost(url)
-    if (!sendToken) await assertPublicHost(url, deps)
+    // EVERY hop (Slack included) is resolved, vetted and pinned.
+    const pin = await vetHost(url, deps)
     const headers: Record<string, string> = { Accept: 'image/*' }
     if (sendToken) headers.Authorization = `Bearer ${deps.botToken}`
-    const resp = await deps.fetch(url.toString(), {
-      method: 'GET',
-      headers,
-      redirect: 'manual',
-      credentials: 'omit',
-      ...(opts.timeoutMs !== undefined ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
-    })
+    const resp = await deps.fetch(
+      url.toString(),
+      {
+        method: 'GET',
+        headers,
+        redirect: 'manual',
+        credentials: 'omit',
+        ...(opts.timeoutMs !== undefined ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+      },
+      pin,
+    )
     if (resp.status >= 300 && resp.status < 400) {
       const loc = resp.headers.get('location')
       if (!loc) throw new ImageFetchRefused(`redirect ${resp.status} with no location`)
