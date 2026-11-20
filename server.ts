@@ -126,13 +126,7 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
-import {
-  chunkImageBlocks,
-  createPrivateImageDeps,
-  replyImageBlocks,
-  resolvePrivateImageBlocks,
-  splitReplyFiles,
-} from './private-image-blocks.ts'
+import { createPrivateImageDeps, resolvePrivateImageBlocks } from './private-image-blocks.ts'
 import {
   beginDurableStream,
   createDeliverySendDeps,
@@ -1140,7 +1134,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description:
-              'Absolute paths of files to upload (optional). png/jpg/gif images post inline as image blocks after the text (alt text = file name); other files post together as one message, in the order given.',
+              'Absolute paths of files to upload (optional). All files post together as one message, in the order given.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1779,83 +1773,6 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     blocks = await resolveCardImages(blocks, 'reply', ctx)
   }
 
-  // Image files (png/jpg/gif) post INLINE as image blocks: guarded exactly
-  // like other reply files (assertSendable + secret-value scan, all before any
-  // upload), uploaded privately, then referenced by slack_file id. Done after
-  // every reject above, so a refused reply uploads nothing. Other files keep
-  // the ordinary file share (H-20261119-057 part A).
-  const { images: imageFiles, others: otherFiles } = splitReplyFiles(files)
-  const imageBlocks =
-    imageFiles.length > 0
-      ? await resolveCardImages(replyImageBlocks(imageFiles.map((f) => resolve(f))), 'reply', ctx)
-      : []
-
-  const result = await sendReplyBody({
-    chatId,
-    threadTs,
-    text,
-    files: otherFiles.length > 0 ? otherFiles : undefined,
-    stream,
-    blocks,
-    ctx,
-  })
-  if (imageBlocks.length === 0) return result
-  const sent = await postReplyImageMessages(chatId, threadTs, imageBlocks, ctx)
-  const first = result.content[0]
-  return {
-    ...result,
-    content: [
-      { type: 'text', text: `${first?.text ?? ''} + ${sent} image(s) inline` },
-      ...result.content.slice(1),
-    ],
-  }
-}
-
-/** Post resolved image blocks (file ids) after the reply's text, at most 50
- *  per message. Durable in a thread while the supervisor is up (the
- *  obligation stores the file ids, so redelivery never re-uploads); direct
- *  otherwise. Returns the number of images posted or queued. */
-async function postReplyImageMessages(
-  chatId: string,
-  threadTs: string | undefined,
-  imageBlocks: Array<Record<string, unknown>>,
-  ctx: ToolContext,
-): Promise<number> {
-  for (const group of chunkImageBlocks(imageBlocks)) {
-    const names = group.map((b) => String(b.alt_text ?? 'image')).join(', ')
-    const fallback = `[image: ${names}]`
-    if (threadTs !== undefined && supervisor !== null) {
-      try {
-        await executeReplyDurablePath({ chatId, threadTs, text: fallback, blocks: group, ctx })
-        continue
-      } catch (durableErr) {
-        if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
-      }
-    }
-    await ctx.web.chat.postMessage({
-      channel: chatId,
-      text: fallback,
-      blocks: group as any,
-      thread_ts: threadTs,
-      unfurl_links: false,
-      unfurl_media: false,
-    })
-  }
-  return imageBlocks.length
-}
-
-/** The send half of `executeReply`, after every guard and image upload:
- *  streaming, durable or direct text (+ non-image files). */
-async function sendReplyBody(opts: {
-  chatId: string
-  threadTs: string | undefined
-  text: string
-  files: string[] | undefined
-  stream: boolean
-  blocks: Array<Record<string, unknown>> | undefined
-  ctx: ToolContext
-}): Promise<ToolResult> {
-  const { chatId, threadTs, text, files, stream, blocks, ctx } = opts
   const access = ctx.getAccess()
   const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
   const mode = access.chunkMode || 'newline'
