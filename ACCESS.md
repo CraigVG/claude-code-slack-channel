@@ -71,6 +71,8 @@ Map of channel IDs to policies. Only channels listed here are monitored.
 - `allowBotIds`: Opt-in list of bot user IDs allowed to deliver messages in this channel. Absent or empty (default) = all bot messages dropped. See "Multi-agent coordination" below.
 - `audit`: Audit-log projection mode for this channel. See "Audit projection (`audit`)" below. Absent or `'off'` (default) = no projection. Values: `'off'` | `'compact'` | `'full'`.
 - `perUserSessions`: If true, each distinct sender gets their **own** session within a shared thread — separate state file, supervisor handle, and `ownerId` — so two humans talking in one thread don't share bridge-session state (`ccsc-kl410`). Absent or false (default) = one shared session per (channel, thread). Isolates the bridge's per-thread book-keeping, not Claude's own conversation memory.
+- `ownThreadsEngaged`: With `requireMention: true`, threads **this bot started** count as engaged: a human reply whose `parent_user_id` is this bot, and a click on this bot's buttons, are delivered without a fresh mention. Absent or false (default) = unchanged. See "Two agents sharing one channel" below.
+- `deferTo`: List of sibling bot user IDs this session yields to in this channel. An unmentioned human message is dropped as `channel.deferred` when it mentions a listed bot, when it is in a thread where a listed bot was mentioned more recently than this one, or when a listed bot started the thread and this bot was never mentioned there. A mention of this bot always wins. Absent or empty (default) = unchanged. See "Two agents sharing one channel" below.
 - `channelCircuitBreaker`: Channel-wide peer-bot circuit breaker (`ccsc-0k7x2`) — trips when total bot velocity across **all** allowlisted bots is runaway-high, catching A→B→C→A rings the per-bot limit misses. Absent = default (40 msgs / 60s). `{ "count": 0, "windowMs": 0 }` disables.
 
 ### Interaction modes
@@ -86,6 +88,25 @@ A channel runs in one of three operator-chosen modes. This is CCSC's edge over a
 **Default:** newly opted-in channels default to **mention-to-engage** (`/slack-channel:access channel <id>`); pass `--ambient` to opt into ambient instead. This keeps Claude quiet by default in shared channels — humans can talk to each other without any agent receiving the message until someone `@`-mentions it.
 
 **Thread-stickiness is human-only (`ccsc-apj.1`).** Once a human engages a thread by mentioning the bot, their subsequent messages *in that thread* are delivered without a fresh mention ("mention once, then converse"). **Peer agents (`allowBotIds`) are never sticky** — a peer bot must `@`-mention the bot on every message. Making agents sticky would re-open the bot-loop/noise problem the peer-bot rate limiter guards, so agent engagement stays per-message-explicit.
+
+### Two agents sharing one channel (`ownThreadsEngaged`, `deferTo`)
+
+Two sessions can split one channel, each through its own Slack app: one hears only what is addressed to it, the other hears everything else. Example: a coordinator that should answer only `@`-mentions, and a worker that takes all other traffic.
+
+```jsonc
+// coordinator (bot U_COORD)
+"C_SHARED": { "requireMention": true,  "allowFrom": [], "ownThreadsEngaged": true, "deferTo": ["U_WORKER"] }
+// worker (bot U_WORKER)
+"C_SHARED": { "requireMention": false, "allowFrom": [], "deferTo": ["U_COORD"] }
+```
+
+- **The latest mention owns a thread.** Each session keeps a session-lifetime set of threads it has handed over: a human mention of a sibling (and not of this bot) adds the thread, a mention of this bot removes it. Unmentioned replies follow the most recently mentioned bot.
+- **Threads a bot started** go to that bot (`ownThreadsEngaged` for the coordinator; the `parent_user_id` rule of `deferTo` for the worker) until a human mentions the other bot there.
+- **Clicks.** Slack sends `block_actions` only to the app that posted the buttons, so with `ownThreadsEngaged` every click is on this bot's own message and is delivered (channel `allowFrom` still applies; ephemeral-button clicks with no thread identity still fail closed).
+- **Accepted overlaps and gaps.** A message that mentions both bots reaches both; its unmentioned follow-ups go to the mention-only side. Thread replies sent with "Also send to channel" (`thread_broadcast`) are dropped by both, as before. A bot mentioning the other bot does not move a thread; only human mentions do.
+- **Restarts.** Both caches are in memory and not shared, so after either session restarts a thread can reach both sessions or neither until someone mentions the intended bot in it once. That mention resyncs the thread.
+- **Keep `allowFrom` identical** on both sides for the shared channel, or the two sessions see different messages and their thread state drifts.
+- **Admin verbs** (`adminCommands`) return before thread engagement is recorded; do not enable them on a split channel.
 
 ### Multi-agent coordination (`allowBotIds`)
 

@@ -18,6 +18,20 @@ import {
   DEFAULT_PEER_BOT_RATE_LIMIT,
 } from './peer-bot-rate-limit.ts'
 
+/** Shared pure fetch-input schema: tests exercise the production boundary. */
+export const FetchMessagesInput = z
+  .object({
+    channel: z.string().min(1),
+    // ADR-005: preserve the prior integer domain; the handler retains its cap.
+    limit: z
+      .number()
+      .positive()
+      .refine(Number.isInteger, { message: 'Expected integer' })
+      .optional(),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
 // ---------------------------------------------------------------------------
@@ -94,6 +108,19 @@ export interface ChannelPolicy {
    *  not share context/ownership. Absent or false → one shared session per
    *  (channel, thread) (the default; behavior unchanged). */
   perUserSessions?: boolean
+  /** On a `requireMention` channel, treat threads THIS bot started as engaged
+   *  (two agents sharing one channel, 2026-10-08): a human reply whose
+   *  `parent_user_id` is this bot, and a click on one of this bot's buttons,
+   *  deliver without a fresh mention. Slack routes `block_actions` only to
+   *  the app that posted the buttons, so every click this app receives is on
+   *  its own message. Absent or false → unchanged mention-stickiness rule. */
+  ownThreadsEngaged?: boolean
+  /** Bot user IDs this session yields to in this channel (two agents sharing
+   *  one channel, 2026-10-08). A HUMAN message that does not mention this bot
+   *  is dropped as `channel.deferred` when it mentions one of these bots, or
+   *  when it is a thread reply whose `parent_user_id` is one of them. A
+   *  mention of this bot always wins. Absent or empty → unchanged. */
+  deferTo?: string[]
 }
 
 export interface PendingEntry {
@@ -171,6 +198,7 @@ export type GateDropReason =
   | 'channel.not_opted' // channel not opted in (no ChannelPolicy)
   | 'channel.allowfrom_miss' // sender not in the channel's allowFrom
   | 'channel.require_mention' // requireMention channel, no mention, thread not engaged (ccsc-apj.1)
+  | 'channel.deferred' // human message addressed to a bot listed in the channel's deferTo
 
 export interface GateResult {
   action: GateAction
@@ -617,7 +645,7 @@ export const SessionSchema = z
     createdAt: z.number(),
     lastActiveAt: z.number(),
     ownerId: z.string(),
-    data: z.record(z.unknown()),
+    data: z.record(z.string(), z.unknown()),
     // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
     // session files (written before this field existed) still validate under
     // the outer `.strict()`.
@@ -1807,7 +1835,7 @@ export function sanitizeFilename(name: string): string {
  * forge fields inside the context window.
  *
  * This sanitizer:
- *  - strips ASCII control chars (including \n, \r, \t, \0, DEL)
+ *  - strips C0 (U+0000–U+001F), DEL (U+007F), and C1 (U+0080–U+009F)
  *  - strips tag/attribute delimiters: < > " ' `
  *  - collapses whitespace runs to a single space
  *  - trims
@@ -1820,7 +1848,7 @@ export function sanitizeDisplayName(raw: unknown): string {
   if (typeof raw !== 'string') return 'unknown'
   const cleaned = raw
     // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — strip C0/C1 control chars from untrusted Slack display names before rendering
-    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
     .replace(/[<>"'`]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
@@ -1879,6 +1907,11 @@ export interface GateOptions {
    *  the backstop). Absent (tests / no wiring) → no thread is engaged, so
    *  `requireMention` behaves exactly as before. */
   engagedThreads?: ReadonlySet<string>
+  /** Threads this session has handed to a `deferTo` bot because the latest
+   *  mention there was of that bot (see `deferredThreadChange`). Keyed like
+   *  `engagedThreads` (`thread_ts ?? ts`). Absent → only the mention and
+   *  parent-thread rules of `deferTo` apply. */
+  deferredThreads?: ReadonlySet<string>
 }
 
 /**
@@ -2032,7 +2065,39 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
 
+  // deferTo: two agents share this channel, and the LATEST mention owns a
+  // thread. An unmentioned human message is left to the sibling when it
+  // mentions the sibling, when its thread is in deferredThreads (the sibling
+  // was mentioned there after us), or when the sibling started the thread and
+  // we were never mentioned in it. A mention of this bot always wins. Peer
+  // bots are handled by allowBotIds, not here.
+  if (!ev.bot_id && policy.deferTo?.length && !isMentioned(ev, botUserId)) {
+    const key = deliveredThreadKey(
+      channel,
+      (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined),
+    )
+    const parent = ev.parent_user_id as string | undefined
+    const siblingThread = !!ev.thread_ts && !!parent && policy.deferTo.includes(parent)
+    if (
+      policy.deferTo.some((id) => isMentioned(ev, id)) ||
+      opts.deferredThreads?.has(key) ||
+      (siblingThread && !opts.engagedThreads?.has(key))
+    ) {
+      return { action: 'drop', dropReason: 'channel.deferred' }
+    }
+  }
+
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
+    // ownThreadsEngaged: a human reply in a thread this bot started.
+    if (
+      !ev.bot_id &&
+      policy.ownThreadsEngaged &&
+      botUserId &&
+      ev.thread_ts &&
+      ev.parent_user_id === botUserId
+    ) {
+      return { action: 'deliver', access }
+    }
     // ccsc-apj.1 — thread-sticky engagement. Once a HUMAN has engaged a
     // thread by mentioning the bot, subsequent human messages in that same
     // thread are delivered without a fresh mention ("mention once, then
@@ -2052,6 +2117,40 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   }
 
   return { action: 'deliver', access }
+}
+
+/** How a human channel message changes this session's `deferredThreads`
+ *  ("latest mention owns the thread", for channels with `deferTo`). Pure; the
+ *  caller applies it for events that passed the channel and allowFrom checks
+ *  (delivered, or dropped as `channel.deferred`).
+ *  - mentions this bot → `remove` the thread (we take it back), except when it
+ *    also mentions a `deferTo` bot on an ambient channel: then `add` (the
+ *    mention-only side owns threads where both bots were mentioned);
+ *  - mentions a `deferTo` bot and not this one → `add` the thread.
+ *  Returns null when nothing changes. */
+export function deferredThreadChange(
+  ev: Record<string, unknown>,
+  access: Access,
+  botUserId: string,
+): { add?: string; remove?: string } | null {
+  if (ev.bot_id || ev.channel_type === 'im') return null
+  const channel = ev.channel as string
+  const policy = getChannelPolicy(access, channel)
+  if (!policy?.deferTo?.length) return null
+  const key = deliveredThreadKey(
+    channel,
+    (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined),
+  )
+  const mentionsSibling = policy.deferTo.some((id) => isMentioned(ev, id))
+  if (botUserId && isMentioned(ev, botUserId)) {
+    // Both bots mentioned: the message reaches both, but the follow-ups need
+    // one owner. The mention-only (coordinator) side keeps the thread; the
+    // ambient side hands it over.
+    if (mentionsSibling && !policy.requireMention) return { add: key }
+    return { remove: key }
+  }
+  if (mentionsSibling) return { add: key }
+  return null
 }
 
 export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
@@ -2151,6 +2250,43 @@ export function stripBotMention(text: string, botUserId: string): string {
   const prefix = `<@${botUserId}>`
   if (!text.startsWith(prefix)) return text
   return text.slice(prefix.length).replace(/^\s+/, '')
+}
+
+/** Result of {@link normalizeSelfMentions}. */
+export interface SelfMentionResult {
+  /** Text to deliver to the session. */
+  text: string
+  /** True when the receiving bot is @-mentioned anywhere in the message. */
+  mentionsYou: boolean
+}
+
+/** Normalize the receiving bot's own `<@U_BOT>` mentions in an inbound
+ *  message before it is delivered to the session (H-20261119-055).
+ *
+ *  - A single LEADING self-mention (the command form `<@me> do X`) is
+ *    stripped, as before.
+ *  - Every OTHER self-mention is replaced with `@you`, so a message that
+ *    names several bots keeps its shape: `<@A> and <@B> look` reads as
+ *    `@you and <@B> look` to A and `<@A> and @you look` to B. The old
+ *    global strip deleted every self-mention, so each bot saw only the
+ *    other bot's id and read the message as addressed to someone else.
+ *  - Mentions of other users and bots are left as-is.
+ *  - `mentionsYou` reports whether a self-mention appeared anywhere.
+ *
+ *  Slack may render a mention with a label (`<@U123|name>`); both forms
+ *  are matched. An empty `botUserId` (identity not resolved yet) returns
+ *  the text unchanged with `mentionsYou: false`. */
+export function normalizeSelfMentions(text: string, botUserId: string): SelfMentionResult {
+  // Slack user ids are A-Z/0-9; anything else is not interpolated into a RegExp.
+  if (!/^[A-Z0-9]+$/.test(botUserId)) return { text, mentionsYou: false }
+  const mention = `<@${botUserId}(?:\\|[^>]*)?>`
+  const trimmed = text.trim()
+  if (!new RegExp(mention).test(trimmed)) return { text: trimmed, mentionsYou: false }
+  const out = trimmed
+    .replace(new RegExp(`^${mention}\\s*`), '')
+    .replace(new RegExp(mention, 'g'), '@you')
+    .trim()
+  return { text: out, mentionsYou: true }
 }
 
 // ---------------------------------------------------------------------------
@@ -2846,7 +2982,9 @@ export type InteractionRoute = { action: 'deliver' } | { action: 'drop'; dropRea
  *  000-docs/session-state-machine.md § "Interactive inbound: button clicks"):
  *
  *  - `requireMention` channels deliver a click only when its thread is already
- *    engaged (a human previously mentioned the bot there) — exactly the
+ *    engaged (a human previously mentioned the bot there), unless the channel
+ *    sets `ownThreadsEngaged` (then every click with a thread identity
+ *    delivers: Slack routes clicks only to the app that posted the buttons) — exactly the
  *    mention-stickiness rule a mention-less *message* gets. A click cannot
  *    carry a mention, so it can never OPEN a thread; on an unengaged thread it
  *    drops as `channel.require_mention`. This closes the quiet path where an
@@ -2887,6 +3025,15 @@ export function decideInteractionRoute(
   if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(interaction.userId)) {
     return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
+  }
+  // ownThreadsEngaged: every click this app receives is on its own message
+  // (Slack routes block_actions only to the posting app). An ephemeral-button
+  // click carries no thread identity and still fails closed.
+  if (policy.requireMention && policy.ownThreadsEngaged) {
+    if (!(interaction.threadTs ?? interaction.messageTs)) {
+      return { action: 'drop', dropReason: 'channel.require_mention' }
+    }
+    return { action: 'deliver' }
   }
   if (policy.requireMention) {
     // Thread key mirrors the message gate: thread_ts ?? message ts. An
