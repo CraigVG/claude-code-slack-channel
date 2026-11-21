@@ -22720,3 +22720,189 @@ describe('PR #5 review (1) — queued multi-file replies stay together on redeli
     expect(src).toContain('sendGroup: (obs) => sendFileGroup(fileSendDeps, obs)')
   })
 })
+
+// ---------------------------------------------------------------------------
+// PR #5 delta review (FIX @2681e7af5d11) — group dedup + single-member file id
+// ---------------------------------------------------------------------------
+
+describe('PR #5 delta (1) — group dedup matches Slack files one-to-one', () => {
+  const T0 = 1_700_000_000_000
+  function fakeClient(threadFiles: Array<{ id: string; name: string; size: number }>) {
+    const uploads: string[][] = []
+    const client = {
+      conversations: {
+        replies: async () => ({
+          messages: [{ ts: String((T0 + 1000) / 1000), files: threadFiles }],
+        }),
+      },
+      filesUploadV2: async (args: {
+        file_uploads?: Array<{ filename: string }>
+        filename?: string
+      }) => {
+        const names = args.file_uploads?.map((f) => f.filename) ?? [args.filename ?? '?']
+        uploads.push(names)
+        return { files: [{ files: names.map((_, i) => ({ id: `NEW${uploads.length}-${i}` })) }] }
+      },
+    }
+    return { client, uploads }
+  }
+  const ob = (i: number, path: string, extra: Record<string, unknown> = {}) => ({
+    id: `g:file:${i}`,
+    channel: 'C',
+    thread: '1700000000.000100',
+    payload: '',
+    attempts: 0,
+    state: 'pending' as const,
+    createdAt: T0,
+    upload: { path, filename: 'photo.png' },
+    uploadGroup: 'g',
+    ...extra,
+  })
+
+  test('two distinct same-name, same-size files with ONE existing match: one dedups, one uploads', async () => {
+    const { client, uploads } = fakeClient([{ id: 'F1', name: 'photo.png', size: 3 }])
+    const deps = createFileSendDeps({
+      client: client as never,
+      assertSendable: () => {},
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: () => new Uint8Array([1, 2, 3]),
+      fileSize: () => 3,
+    })
+    const ids = await sendFileGroup(deps, [ob(0, '/a/photo.png'), ob(1, '/b/photo.png')])
+    expect(ids[0]).toBe('F1')
+    expect(ids[1]).not.toBe('F1')
+    expect(ids[1]).toMatch(/^NEW/)
+    expect(uploads).toEqual([['photo.png']])
+  })
+
+  test('an exact recorded id is honoured first, even when a sibling would name-match it', async () => {
+    const { client, uploads } = fakeClient([
+      { id: 'F1', name: 'photo.png', size: 3 },
+      { id: 'F2', name: 'photo.png', size: 3 },
+    ])
+    const deps = createFileSendDeps({
+      client: client as never,
+      assertSendable: () => {},
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: () => new Uint8Array([1, 2, 3]),
+      fileSize: () => 3,
+    })
+    // Member 1 already recorded F1; member 0 must not take F1 by name/size.
+    const ids = await sendFileGroup(deps, [
+      ob(0, '/a/photo.png'),
+      ob(1, '/b/photo.png', { uploadedFileId: 'F1' }),
+    ])
+    expect(ids).toEqual(['F2', 'F1'])
+    expect(uploads).toEqual([])
+  })
+
+  test('findUploaded skips ids the caller already claimed', async () => {
+    const { client } = fakeClient([{ id: 'F1', name: 'photo.png', size: 3 }])
+    const deps = createFileSendDeps({
+      client: client as never,
+      assertSendable: () => {},
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: () => new Uint8Array([1, 2, 3]),
+      fileSize: () => 3,
+    })
+    expect(await deps.findUploaded(ob(0, '/a/photo.png'))).toBe('F1')
+    expect(await deps.findUploaded(ob(0, '/a/photo.png'), new Set(['F1']))).toBeNull()
+    expect(
+      await deps.findUploaded(ob(0, '/a/photo.png', { uploadedFileId: 'F1' }), new Set(['F1'])),
+    ).toBeNull()
+  })
+})
+
+describe('PR #5 delta (2) — a lone pending group member keeps its Slack file id', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  const key = { channel: 'C_ONE', thread: 'T1' }
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-one-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => rmSync(rawRoot, { recursive: true, force: true }))
+  const makeSupervisor = () =>
+    createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => 1_700_000_000_000,
+      leaseTtlMs: 60_000,
+      ownerId: 'OWNER-1',
+    })
+
+  test('one pending member of a group goes through send and its returned id is persisted', async () => {
+    await makeSupervisor().activate(key, 'U')
+    const sup = makeSupervisor()
+    // Two-file reply: file 0 uploads inline, file 1 hits a transient error.
+    let n = 0
+    const deps: FileUploadDeps = {
+      readAndGuard: async () => new Uint8Array([1]),
+      findUploaded: async () => null,
+      upload: async () => {
+        n++
+        if (n === 2)
+          throw Object.assign(new Error('slack: rate_limited'), {
+            data: { ok: false, error: 'rate_limited' },
+          })
+        return 'F-first'
+      },
+    }
+    await deliverFileReplyDurably(
+      { supervisor: sup, post: async () => 'ts', files: deps },
+      {
+        id: 'o-1',
+        channel: 'C_ONE',
+        thread: 'T1',
+        chunks: ['two'],
+        files: ['a.png', 'b.png'].map((f) => ({ path: `/r/${f}`, filename: f })),
+      },
+    )
+    const pending = await sup.pendingDeliveries()
+    expect(pending.map((o) => o.id)).toEqual(['o-1:file:1'])
+    const report = await sup.drainOutbox(async () => 'F-second', {
+      delayMs: async () => {},
+      sendGroup: async () => ['unused'],
+    })
+    expect(report.delivered).toEqual(['o-1:file:1'])
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'o-1:file:1')?.uploadedFileId).toBe('F-second')
+  })
+
+  test('a TEXT obligation never stores a returned value as a file id', async () => {
+    await makeSupervisor().activate(key, 'U')
+    const sup = makeSupervisor()
+    await deliverFileReplyDurably(
+      {
+        supervisor: sup,
+        post: async () => {
+          throw Object.assign(new Error('slack: rate_limited'), {
+            data: { ok: false, error: 'rate_limited' },
+          })
+        },
+        files: {
+          readAndGuard: async () => new Uint8Array([1]),
+          findUploaded: async () => null,
+          upload: async () => 'F',
+        },
+      },
+      { id: 't-1', channel: 'C_ONE', thread: 'T1', chunks: ['hi'], files: [] },
+    )
+    await sup.drainOutbox(async () => 'ts-not-a-file', { delayMs: async () => {} })
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 't-1:0')).toMatchObject({ state: 'delivered' })
+    expect(obs.find((o) => o.id === 't-1:0')?.uploadedFileId).toBeUndefined()
+  })
+
+  test('wiring: the server poller returns the uploaded file id from the single-file send', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const at = src.indexOf('const outboxSend = ')
+    expect(at).toBeGreaterThan(-1)
+    const fn = src.slice(at, at + 400)
+    expect(fn).toContain('sendFileObligation(fileSendDeps, ob)')
+    expect(fn).not.toContain('.then(() => undefined)')
+  })
+})
