@@ -23092,3 +23092,63 @@ describe('PR #8 delta E — refusal messages carry no response-header text', () 
     expect((err as Error).message).not.toContain('ECHOED')
   })
 })
+
+// ---------------------------------------------------------------------------
+// PR #8 round-2 delta (FIX @bd024bb8c2ad) — a FAST users.info failure
+// ---------------------------------------------------------------------------
+
+describe('PR #8 delta 2 — a fast users.info failure takes the format-checked fallback', () => {
+  const sanitize = (raw: unknown) =>
+    typeof raw === 'string' ? raw.replace(/[<>"'`]/g, '') : 'unknown'
+
+  test('a users.info error resolves FAST to the checked fallback, never the raw id', async () => {
+    const { createUserNameResolver, resolveActorName } = await import('./thread-context.ts')
+    const resolve = createUserNameResolver({
+      usersInfo: async () => Promise.reject(new Error('user_not_found')),
+      sanitize,
+      cache: new Map(),
+    })
+    expect(await resolve('<script>alert(1)</script>')).toBe('unknown')
+    expect(await resolve('U0ABC123')).toBe('U0ABC123')
+    // Through the production wrapper, with a generous deadline (the failure is fast).
+    expect(await resolveActorName('<script>', resolve, 5000)).toBe('unknown')
+  })
+
+  test('a response with no name fields also takes the checked fallback', async () => {
+    const { createUserNameResolver } = await import('./thread-context.ts')
+    const resolve = createUserNameResolver({
+      usersInfo: async () => ({ user: { profile: {} } }),
+      sanitize,
+      cache: new Map(),
+    })
+    expect(await resolve('bad id')).toBe('unknown')
+    expect(await resolve('U0ABC123')).toBe('U0ABC123')
+  })
+
+  test('a real name is sanitized and cached; failures are not cached', async () => {
+    const { createUserNameResolver } = await import('./thread-context.ts')
+    let calls = 0
+    let fail = true
+    const cache = new Map<string, string>()
+    const resolve = createUserNameResolver({
+      usersInfo: async () => {
+        calls++
+        if (fail) throw new Error('ratelimited')
+        return { user: { profile: { display_name: 'Ni"ck<' } } }
+      },
+      sanitize,
+      cache,
+    })
+    expect(await resolve('U1')).toBe('U1')
+    fail = false
+    expect(await resolve('U1')).toBe('Nick')
+    expect(await resolve('U1')).toBe('Nick')
+    expect(calls).toBe(2)
+  })
+
+  test('wiring: the server resolver is the checked one', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain('const resolveUserName = createUserNameResolver({')
+    expect(src).not.toContain('return sanitizeDisplayName(userId)')
+  })
+})

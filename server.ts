@@ -156,6 +156,7 @@ import {
   buildInboundContextMeta,
   cardTitleMeta,
   channelNameMeta,
+  createUserNameResolver,
   fetchMessagesHeader,
   METADATA_DEADLINE_MS,
   quoteSnippet,
@@ -862,22 +863,13 @@ async function gate(event: unknown): Promise<GateResult> {
 
 const userNameCache = new Map<string, string>()
 
-async function resolveUserName(userId: string): Promise<string> {
-  if (userNameCache.has(userId)) return userNameCache.get(userId)!
-  try {
-    const res = await web.users.info({ user: userId })
-    // All three Slack-provided name fields are attacker-controlled (the
-    // workspace member can set them). Sanitize before caching so every
-    // downstream consumer gets a scrubbed value.
-    const rawName =
-      res.user?.profile?.display_name || res.user?.profile?.real_name || res.user?.name || userId
-    const name = sanitizeDisplayName(rawName)
-    userNameCache.set(userId, name)
-    return name
-  } catch {
-    return sanitizeDisplayName(userId)
-  }
-}
+/** Sanitized, cached display names. A failed or empty users.info gives the
+ *  format-checked id fallback, never the raw id (thread-context.ts). */
+const resolveUserName = createUserNameResolver({
+  usersInfo: (user) => web.users.info({ user }),
+  sanitize: sanitizeDisplayName,
+  cache: userNameCache,
+})
 
 // ---------------------------------------------------------------------------
 // Channel names + thread context (H-20261119-057 part C)
