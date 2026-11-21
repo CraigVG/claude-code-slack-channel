@@ -578,12 +578,16 @@ export async function deliverFileReplyDurably(
     // message; trailing chunks, if any, are plain-text continuation).
     ...(i === 0 && reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
   }))
+  // 2+ files share an upload group, so a poller redelivery keeps them together
+  // (one message, in order) instead of uploading each on its own.
+  const group = reply.files.length > 1 ? { uploadGroup: reply.id } : {}
   const fileRecords = reply.files.map((upload, j) => ({
     id: `${reply.id}:file:${j}`,
     channel: reply.channel,
     thread: reply.thread,
     payload: '',
     upload,
+    ...group,
   }))
   const records = [...textRecords, ...fileRecords]
   await recordBeforeSend(() => handle.recordTerminalDeliveries(token, records))
@@ -709,6 +713,41 @@ async function deliverFileObligations(
     if (await markFailed(handle, token, failed, err)) throw err
     return { sent: deduped.size, queued: true }
   }
+}
+
+/** Poller redelivery of ONE upload group (PR #5 review): the pending file
+ *  obligations of a multi-file reply, in record order. Dedup each, then
+ *  read+guard EVERY remaining file before uploading any (a block throws
+ *  `ExfilBlockedError` and nothing uploads), then upload them in one
+ *  `uploadMany` call (one message, order kept). Returns the Slack file id per
+ *  obligation, aligned with `obs` (`''` when none is known). Without
+ *  `uploadMany` the guarded files upload one by one. */
+export async function sendFileGroup(
+  files: FileUploadDeps,
+  obs: DeliveryObligation[],
+): Promise<string[]> {
+  const ids: string[] = obs.map(() => '')
+  const batch: Array<{ index: number; ob: DeliveryObligation; bytes: Uint8Array }> = []
+  for (const [index, ob] of obs.entries()) {
+    const existing = await files.findUploaded(ob)
+    if (existing) {
+      ids[index] = existing
+      continue
+    }
+    if (ob.upload === undefined) throw new Error('file obligation has no upload descriptor')
+    batch.push({ index, ob, bytes: await files.readAndGuard(ob.upload) })
+  }
+  if (batch.length === 0) return ids
+  if (files.uploadMany !== undefined && batch.length > 1) {
+    const got = await files.uploadMany(
+      batch.map((b) => b.ob),
+      batch.map((b) => b.bytes),
+    )
+    for (const [i, b] of batch.entries()) ids[b.index] = got[i] ?? ''
+    return ids
+  }
+  for (const b of batch) ids[b.index] = await files.upload(b.ob, b.bytes)
+  return ids
 }
 
 /** Pull the uploaded Slack file id out of a `filesUploadV2` response, tolerant of
@@ -887,3 +926,4 @@ async function markObligation(
     // Swallow — the poller reconciles obligation state from disk.
   }
 }
+

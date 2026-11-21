@@ -126,6 +126,7 @@ import {
   deliverChunkedReplyDurably,
   deliverFileReplyDurably,
   deliverReplyDurably,
+  sendFileGroup,
   sendFileObligation,
 } from './slack-delivery.ts'
 import { type StreamReplyResult, streamReply } from './stream-reply.ts'
@@ -4230,7 +4231,9 @@ async function main(): Promise<void> {
       : idempotentSend(ob)
   const drainOutboxOnce = (): void => {
     void supervisor!
-      .drainOutbox(outboxSend)
+      // PR #5 review: a queued multi-file reply is redelivered as ONE upload
+      // (guard every file, then one filesUploadV2), never file by file.
+      .drainOutbox(outboxSend, { sendGroup: (obs) => sendFileGroup(fileSendDeps, obs) })
       .then((report) => {
         if (report.deadLettered.length > 0) {
           console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)

@@ -285,6 +285,8 @@ export interface SessionHandle {
       payload: string
       blocks?: Array<Record<string, unknown>>
       upload?: { path: string; filename: string; comment?: string }
+      /** PR #5 review — the upload group (reply id) of a multi-file reply. */
+      uploadGroup?: string
     }[],
   ): Promise<void>
 
@@ -513,8 +515,92 @@ export interface SessionSupervisor {
    *  Returns an `OutboxDrainReport`. */
   drainOutbox(
     send: (obligation: DeliveryObligation) => Promise<void>,
-    opts?: { maxAttempts?: number; delayMs?: (ms: number) => Promise<void> },
+    opts?: {
+      maxAttempts?: number
+      delayMs?: (ms: number) => Promise<void>
+      /** PR #5 review — deliver the pending files of one upload group (a
+       *  multi-file reply) TOGETHER, in record order; returns their Slack file
+       *  ids (aligned). Without it every obligation goes through `send` alone. */
+      sendGroup?: (obligations: DeliveryObligation[]) => Promise<string[] | void>
+    },
   ): Promise<OutboxDrainReport>
+}
+
+/** Split pending obligations into delivery units, in order: each pending
+ *  obligation alone, except that (when grouping is on) the pending file
+ *  obligations sharing an `uploadGroup` in one (channel, thread) form ONE unit
+ *  at the position of their first member (PR #5 review). */
+function groupDeliveryUnits(
+  pending: readonly DeliveryObligation[],
+  grouping: boolean,
+): DeliveryObligation[][] {
+  const units: DeliveryObligation[][] = []
+  const byGroup = new Map<string, DeliveryObligation[]>()
+  for (const ob of pending) {
+    if (!grouping || ob.uploadGroup === undefined || ob.upload === undefined) {
+      units.push([ob])
+      continue
+    }
+    const gk = `${ob.channel}\u0000${ob.thread}\u0000${ob.uploadGroup}`
+    const existing = byGroup.get(gk)
+    if (existing) {
+      existing.push(ob)
+      continue
+    }
+    const unit = [ob]
+    byGroup.set(gk, unit)
+    units.push(unit)
+  }
+  return units
+}
+
+/** The poller's in-pass retry loop for one delivery unit, with exponential
+ *  backoff bounded by `maxAttempts`. `attempts` starts from the persisted
+ *  count so retries accumulate across passes. Returns `null` when the lease
+ *  was lost before a send (yield without sending — leave pending). */
+async function retryDelivery(
+  handle: SessionHandle,
+  token: number,
+  startAttempts: number,
+  sendOnce: () => Promise<void>,
+  opts: {
+    maxAttempts: number
+    delayMs: (ms: number) => Promise<void>
+    onLeaseLost: () => void
+  },
+): Promise<{ finalState: 'delivered' | 'dead'; attempts: number; lastError?: string } | null> {
+  let attempts = startAttempts
+  for (;;) {
+    // Re-check the lease immediately before each send. `heartbeat` returns
+    // false if a newer owner superseded the token (or the handle was
+    // quarantined) — yield without sending so a stale owner never races a
+    // live one into a double-send. On success it also renews the lease,
+    // keeping it live across legitimate backoff waits.
+    if (!handle.heartbeat(token)) {
+      opts.onLeaseLost()
+      return null
+    }
+    try {
+      await sendOnce()
+      return { finalState: 'delivered', attempts: attempts + 1 }
+    } catch (err) {
+      attempts++
+      const code = extractSlackErrorCode(err)
+      const lastError = code ?? errorMessage(err)
+      // ccsc-o7x.5 — an exfil-guard block on a file (re)upload is permanent:
+      // the bytes won't pass on a retry, so dead-letter immediately rather
+      // than burn maxAttempts. ExfilBlockedError carries no Slack code, so
+      // classifyDeliveryError would otherwise treat it as retryable.
+      if (err instanceof ExfilBlockedError || classifyDeliveryError(code) === 'non-retryable') {
+        return { finalState: 'dead', attempts, lastError }
+      }
+      if (attempts >= opts.maxAttempts) {
+        // Retryable but persistently failing — dead-letter rather than loop forever.
+        return { finalState: 'dead', attempts, lastError }
+      }
+      await opts.delayMs(computeBackoffMs(attempts))
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,7 +1282,11 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
 
     async drainOutbox(
       send: (obligation: DeliveryObligation) => Promise<void>,
-      opts?: { maxAttempts?: number; delayMs?: (ms: number) => Promise<void> },
+      opts?: {
+        maxAttempts?: number
+        delayMs?: (ms: number) => Promise<void>
+        sendGroup?: (obligations: DeliveryObligation[]) => Promise<string[] | void>
+      },
     ): Promise<OutboxDrainReport> {
       const maxAttempts = opts?.maxAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS
       const delayMs = opts?.delayMs ?? defaultDelayMs
@@ -1208,9 +1298,11 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
       }
 
       const pending = await this.pendingDeliveries()
-      for (const ob of pending) {
-        report.scanned++
-        const key: SessionKey = { channel: ob.channel, thread: ob.thread }
+      for (const unit of groupDeliveryUnits(pending, opts?.sendGroup !== undefined)) {
+        report.scanned += unit.length
+        const ids = unit.map((o) => o.id)
+        const first = unit[0]!
+        const key: SessionKey = { channel: first.channel, thread: first.thread }
 
         // Activate to obtain the session's live handle + its fencing lease. A
         // quarantined / unloadable session is skipped (recovery owns it); the
@@ -1222,68 +1314,39 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
           log('outbox.activate_error', {
             channel: key.channel,
             thread: key.thread,
-            id: ob.id,
+            id: first.id,
             error: errorMessage(err),
           })
-          report.skipped.push(ob.id)
+          report.skipped.push(...ids)
           continue
         }
         const lease = handle.lease
         if (lease === null) {
-          report.skipped.push(ob.id)
+          report.skipped.push(...ids)
           continue
         }
         const token = lease.token
 
-        // In-pass retry loop with exponential backoff, bounded by maxAttempts.
-        // `attempts` starts from the obligation's persisted count so retries
-        // accumulate across passes too. `finalState === null` means we yielded
-        // on lease loss without sending — leave the obligation pending.
-        let attempts = ob.attempts
-        let finalState: 'delivered' | 'dead' | null = null
-        let lastError: string | undefined
-        for (;;) {
-          // Re-check the lease immediately before each send. `heartbeat` returns
-          // false if a newer owner superseded the token (or the handle was
-          // quarantined) — yield without sending so a stale owner never races a
-          // live one into a double-send. On success it also renews the lease,
-          // keeping it live across legitimate backoff waits.
-          if (!handle.heartbeat(token)) {
-            log('outbox.lease_lost', { channel: key.channel, thread: key.thread, id: ob.id })
-            break
-          }
-          try {
-            await send(ob)
-            attempts++
-            finalState = 'delivered'
-            break
-          } catch (err) {
-            attempts++
-            const code = extractSlackErrorCode(err)
-            lastError = code ?? errorMessage(err)
-            // ccsc-o7x.5 — an exfil-guard block on a file (re)upload is permanent:
-            // the bytes won't pass on a retry, so dead-letter immediately rather
-            // than burn maxAttempts. ExfilBlockedError carries no Slack code, so
-            // classifyDeliveryError would otherwise treat it as retryable.
-            if (
-              err instanceof ExfilBlockedError ||
-              classifyDeliveryError(code) === 'non-retryable'
-            ) {
-              finalState = 'dead'
-              break
-            }
-            if (attempts >= maxAttempts) {
-              // Retryable but persistently failing — dead-letter rather than
-              // loop forever.
-              finalState = 'dead'
-              break
-            }
-            await delayMs(computeBackoffMs(attempts))
+        // One unit = one obligation, or one upload group (PR #5 review): the
+        // pending files of a multi-file reply go out together in ONE send so a
+        // queued reply still posts as one message. A group shares one attempt
+        // count, one outcome and one dead-letter decision.
+        let fileIds: string[] | undefined
+        const sendUnit = async (): Promise<void> => {
+          if (unit.length > 1 && opts?.sendGroup !== undefined) {
+            fileIds = (await opts.sendGroup(unit)) ?? undefined
+          } else {
+            await send(first)
           }
         }
-
-        if (finalState === null) {
-          report.skipped.push(ob.id)
+        const outcome = await retryDelivery(handle, token, first.attempts, sendUnit, {
+          maxAttempts,
+          delayMs,
+          onLeaseLost: () =>
+            log('outbox.lease_lost', { channel: key.channel, thread: key.thread, id: first.id }),
+        })
+        if (outcome === null) {
+          report.skipped.push(...ids)
           continue
         }
 
@@ -1299,29 +1362,36 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
           log('outbox.lease_lost_pre_persist', {
             channel: key.channel,
             thread: key.thread,
-            id: ob.id,
+            id: first.id,
           })
-          report.skipped.push(ob.id)
+          report.skipped.push(...ids)
           continue
         }
 
-        // Persist the resolved obligation state in one fenced write. The fence
-        // (same held token, just re-validated above) is belt-and-suspenders for
-        // the microtask-window race; a save failure self-quarantines the handle.
-        // Either way: record + skip, never throw.
-        const resolved = finalState
-        const resolvedAttempts = attempts
-        const resolvedError = lastError
+        // Persist the resolved state of every obligation in the unit in one
+        // fenced write. The fence (same held token, just re-validated above) is
+        // belt-and-suspenders for the microtask-window race; a save failure
+        // self-quarantines the handle. Either way: record + skip, never throw.
+        const {
+          finalState: resolved,
+          attempts: resolvedAttempts,
+          lastError: resolvedError,
+        } = outcome
+        const idSet = new Set(ids)
+        const uploaded = new Map(ids.map((id, i) => [id, fileIds?.[i] ?? '']))
         try {
           await handle.update(
             (prev) => ({
               ...prev,
               outbox: (prev.outbox ?? []).map((o) =>
-                o.id === ob.id
+                idSet.has(o.id)
                   ? {
                       ...o,
                       attempts: resolvedAttempts,
                       state: resolved,
+                      ...(resolved === 'delivered' && uploaded.get(o.id)
+                        ? { uploadedFileId: uploaded.get(o.id) }
+                        : {}),
                       // Record WHY only on dead-letter — a `delivered` record needs
                       // no outstanding error (the attempt count still signals any
                       // transient retries it survived).
@@ -1338,17 +1408,17 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
           log('outbox.persist_error', {
             channel: key.channel,
             thread: key.thread,
-            id: ob.id,
+            id: first.id,
             error: errorMessage(err),
           })
-          report.skipped.push(ob.id)
+          report.skipped.push(...ids)
           continue
         }
 
         if (resolved === 'delivered') {
-          report.delivered.push(ob.id)
+          report.delivered.push(...ids)
         } else {
-          report.deadLettered.push({ id: ob.id, error: resolvedError ?? 'unknown' })
+          for (const id of ids) report.deadLettered.push({ id, error: resolvedError ?? 'unknown' })
         }
       }
 
@@ -1545,6 +1615,7 @@ class ConcreteHandle implements SessionHandle {
       blocks?: Array<Record<string, unknown>>
       // ccsc-o7x.5 — when present, this is a durable FILE-upload obligation.
       upload?: { path: string; filename: string; comment?: string }
+      uploadGroup?: string
     }[],
   ): Promise<void> {
     const now = this.clock()
@@ -1558,6 +1629,7 @@ class ConcreteHandle implements SessionHandle {
       createdAt: now,
       ...(reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
       ...(reply.upload !== undefined ? { upload: reply.upload } : {}),
+      ...(reply.uploadGroup !== undefined ? { uploadGroup: reply.uploadGroup } : {}),
     }))
     // One atomic save appends ALL obligations AND clears the in-flight marker:
     // a chunked reply's "turn done, N replies owed" is a single durable fact.

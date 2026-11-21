@@ -38,13 +38,16 @@ export interface PrivateImageDeps {
   /** `files.info` for one id → the `file` object (or undefined). */
   fileInfo(id: string): Promise<Record<string, unknown> | undefined>
   sleep(ms: number): Promise<void>
+  /** Wall clock (epoch ms) for the readiness deadline. Default `Date.now`. */
+  now?(): number
 }
 
 export interface ResolveOptions {
   /** Waits between `files.info` polls, in order; the last value repeats until
    *  `maxWaitMs` is spent. */
   pollDelaysMs?: number[]
-  /** Total time budget for one file to become ready. */
+  /** Total time budget for ALL files to become ready, enforced both as
+   *  wall-clock time and as total poll-sleep time (whichever runs out first). */
   maxWaitMs?: number
 }
 
@@ -100,26 +103,54 @@ export function isImageReady(file: Record<string, unknown> | undefined): boolean
   return Object.keys(file).some((k) => k.startsWith('thumb_') && typeof file[k] === 'string')
 }
 
-async function waitUntilReady(id: string, deps: PrivateImageDeps, opts: ResolveOptions): Promise<void> {
-  const delays = opts.pollDelaysMs ?? DEFAULT_POLL_DELAYS_MS
-  const budget = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS
-  let waited = 0
+const NOT_YET = Symbol('not-yet')
+
+/** `p`, or NOT_YET once `ms` of REAL time pass. A stalled call can never hold
+ *  the caller past its deadline; its late answer is ignored (and a late
+ *  rejection is swallowed). */
+function within<T>(p: Promise<T>, ms: number): Promise<T | typeof NOT_YET> {
+  return new Promise((resolveValue) => {
+    const timer = setTimeout(() => resolveValue(NOT_YET), Math.max(0, ms))
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolveValue(v)
+      },
+      () => {
+        clearTimeout(timer)
+        resolveValue(NOT_YET)
+      },
+    )
+  })
+}
+
+/** Poll `files.info` until the file is ready, never past `deadline` (epoch
+ *  ms, wall clock — PR #5 review: the budget used to count sleep time only, so
+ *  a slow or stalled `files.info` could outlive it). Each call and each sleep
+ *  is cut to the time left. A transient error counts as "not ready yet". */
+async function waitUntilReady(
+  id: string,
+  deps: PrivateImageDeps,
+  delays: number[],
+  deadline: number,
+  budget: number,
+  spent: { sleptMs: number },
+): Promise<void> {
+  const now = deps.now ?? Date.now
+  const notReady = () =>
+    new Error(
+      `image ${id} was not processed by Slack within ${budget}ms; the card was not posted (retry the reply)`,
+    )
   for (let attempt = 0; ; attempt++) {
-    let file: Record<string, unknown> | undefined
-    try {
-      file = await deps.fileInfo(id)
-    } catch {
-      file = undefined // a transient files.info error counts as "not ready yet"
-    }
-    if (isImageReady(file)) return
+    const left = deadline - now()
+    if (left <= 0) throw notReady()
+    const file = await within(deps.fileInfo(id), left)
+    if (file !== NOT_YET && isImageReady(file) && now() <= deadline) return
     const delay = delays[Math.min(attempt, delays.length - 1)] ?? 1000
-    if (waited + delay > budget) {
-      throw new Error(
-        `image ${id} was not processed by Slack within ${budget}ms; the card was not posted (retry the reply)`,
-      )
-    }
-    await deps.sleep(delay)
-    waited += delay
+    const leftAfter = deadline - now()
+    if (delay >= leftAfter || spent.sleptMs + delay > budget) throw notReady()
+    await within(deps.sleep(delay), leftAfter)
+    spent.sleptMs += delay
   }
 }
 
@@ -149,7 +180,14 @@ export async function resolvePrivateImageBlocks<T>(
     if (!id) throw new Error(`private upload returned no file id for ${basenameOf(path)}`)
     idByPath.set(path, id)
   }
-  for (const id of idByPath.values()) await waitUntilReady(id, deps, opts)
+  // ONE wall-clock budget for all images together, starting after the upload.
+  const budget = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS
+  const delays = opts.pollDelaysMs ?? DEFAULT_POLL_DELAYS_MS
+  const deadline = (deps.now ?? Date.now)() + budget
+  const spent = { sleptMs: 0 }
+  for (const id of idByPath.values()) {
+    await waitUntilReady(id, deps, delays, deadline, budget, spent)
+  }
   for (const ref of refs) ref.node.slack_file = { id: idByPath.get(ref.path) }
   return copy
 }
