@@ -117,8 +117,13 @@ import {
 } from './policy.ts'
 import {
   createPrivateImageDeps,
+  type EditTargetLookupClient,
+  findLocalImageRefs,
   type ImageUploadTarget,
-  resolvePrivateImageBlocks,
+  type PrivateImageDeps,
+  type ResolvedImageBlocks,
+  resolveAndApplyEditWithImages,
+  resolveImageBlocksWithCleanup,
 } from './private-image-blocks.ts'
 import {
   beginDurableStream,
@@ -130,6 +135,7 @@ import {
   deliverChunkedReplyDurably,
   deliverFileReplyDurably,
   deliverReplyDurably,
+  type ReplyPoster,
   sendFileObligation,
 } from './slack-delivery.ts'
 import { type StreamReplyResult, streamReply } from './stream-reply.ts'
@@ -1058,7 +1064,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           thread_ts: {
             type: 'string',
             description:
-              'Parent thread timestamp when editing a message in a thread (optional; used for outbound thread gating and to share inline local images into the same thread)',
+              'Parent thread timestamp when editing a message in a thread (optional; when editing blocks with local inline images, verified against the target card on Slack and resolved automatically if omitted)',
           },
           blocks: {
             type: 'array',
@@ -1213,24 +1219,31 @@ function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolC
  *  members can view them, guarded like reply files and only once Slack can
  *  render them. Returns the blocks unchanged when none carry a local path.
  *  See private-image-blocks.ts. */
+function buildCardImageDeps(toolName: string, ctx: ToolContext): PrivateImageDeps {
+  return createPrivateImageDeps({
+    client: ctx.web as unknown as Parameters<typeof createPrivateImageDeps>[0]['client'],
+    assertSendable: ctx.assertSendable,
+    assertNoSecretValues: ctx.assertNoSecretValues,
+    journalExfilBlock: (reason) =>
+      ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName, reason }),
+    readFile: (p) => readFileSync(resolve(p)),
+  })
+}
+
 function resolveCardImages<T>(
   blocks: T,
   toolName: string,
   target: ImageUploadTarget,
   ctx: ToolContext,
-): Promise<T> {
-  return resolvePrivateImageBlocks(
-    blocks,
-    createPrivateImageDeps({
-      client: ctx.web as unknown as Parameters<typeof createPrivateImageDeps>[0]['client'],
-      assertSendable: ctx.assertSendable,
-      assertNoSecretValues: ctx.assertNoSecretValues,
-      journalExfilBlock: (reason) =>
-        ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName, reason }),
-      readFile: (p) => readFileSync(resolve(p)),
-    }),
-    target,
-  )
+): Promise<ResolvedImageBlocks<T>> {
+  return resolveImageBlocksWithCleanup(blocks, buildCardImageDeps(toolName, ctx), target)
+}
+
+async function ensureEditIdentity(ctx: ToolContext): Promise<void> {
+  if (ctx.botUserId !== '' || ctx.selfBotId !== '') return
+  await Promise.race([identitySettled, new Promise((r) => setTimeout(r, 5_000))])
+  ctx.botUserId = botUserId
+  ctx.selfBotId = selfBotId
 }
 
 // -----------------------------------------------------------------------
@@ -1463,21 +1476,28 @@ async function executeReplyDurablePath(opts: {
   threadTs: string
   text: string
   blocks?: Array<Record<string, unknown>>
+  cleanupImages?: () => Promise<void>
   ctx: ToolContext
 }): Promise<ToolResult> {
-  const { chatId, threadTs, text, blocks, ctx } = opts
+  const { chatId, threadTs, text, blocks, cleanupImages, ctx } = opts
   if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
 
-  const result = await deliverReplyDurably(
-    { supervisor, post: createReplyPoster(ctx.web) },
-    {
-      id: randomUUID(),
-      channel: chatId,
-      thread: threadTs,
-      text,
-      ...(blocks !== undefined ? { blocks } : {}),
-    },
-  )
+  let result: Awaited<ReturnType<typeof deliverReplyDurably>>
+  try {
+    result = await deliverReplyDurably(
+      { supervisor, post: createReplyPoster(ctx.web) },
+      {
+        id: randomUUID(),
+        channel: chatId,
+        thread: threadTs,
+        text,
+        ...(blocks !== undefined ? { blocks } : {}),
+      },
+    )
+  } catch (err) {
+    if (!(err instanceof DurableUnavailableError)) await cleanupImages?.()
+    throw err
+  }
 
   if (result.status === 'delivered') {
     return {
@@ -1559,9 +1579,10 @@ async function executeReplyFileDurablePath(opts: {
   chunks: string[]
   files: string[]
   blocks?: Array<Record<string, unknown>>
+  cleanupImages?: () => Promise<void>
   ctx: ToolContext
 }): Promise<ToolResult> {
-  const { chatId, threadTs, chunks, files, blocks, ctx } = opts
+  const { chatId, threadTs, chunks, files, blocks, cleanupImages, ctx } = opts
   if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
 
   const fileDeps = createFileSendDeps({
@@ -1579,17 +1600,31 @@ async function executeReplyFileDurablePath(opts: {
   const textChunks = chunks.filter((c) => c.length > 0)
   const fileDescriptors = files.map((p) => ({ path: p, filename: basename(resolve(p)) }))
 
-  const result = await deliverFileReplyDurably(
-    { supervisor, post: createReplyPoster(ctx.web), files: fileDeps },
-    {
-      id: randomUUID(),
-      channel: chatId,
-      thread: threadTs,
-      chunks: textChunks,
-      files: fileDescriptors,
-      ...(blocks !== undefined ? { blocks } : {}),
-    },
-  )
+  let cardPosted = false
+  const basePoster = createReplyPoster(ctx.web)
+  const post: ReplyPoster = async (obligation, idemKey) => {
+    const ts = await basePoster(obligation, idemKey)
+    if (obligation.blocks !== undefined) cardPosted = true
+    return ts
+  }
+
+  let result: Awaited<ReturnType<typeof deliverFileReplyDurably>>
+  try {
+    result = await deliverFileReplyDurably(
+      { supervisor, post, files: fileDeps },
+      {
+        id: randomUUID(),
+        channel: chatId,
+        thread: threadTs,
+        chunks: textChunks,
+        files: fileDescriptors,
+        ...(blocks !== undefined ? { blocks } : {}),
+      },
+    )
+  } catch (err) {
+    if (!(err instanceof DurableUnavailableError) && !cardPosted) await cleanupImages?.()
+    throw err
+  }
 
   if (result.status === 'delivered') {
     return {
@@ -1612,6 +1647,78 @@ async function executeReplyFileDurablePath(opts: {
   }
 }
 
+async function deliverNonStreamingReply(opts: {
+  chatId: string
+  threadTs: string | undefined
+  text: string
+  chunks: string[]
+  files: string[] | undefined
+  blocks: Array<Record<string, unknown>> | undefined
+  stream: boolean
+  cleanupImages?: () => Promise<void>
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, text, chunks, files, blocks, stream, cleanupImages, ctx } = opts
+  const hasFiles = files !== undefined && files.length > 0
+
+  if (!stream && threadTs !== undefined && supervisor !== null) {
+    try {
+      if (hasFiles) {
+        return await executeReplyFileDurablePath({
+          chatId,
+          threadTs,
+          chunks,
+          files,
+          blocks,
+          cleanupImages,
+          ctx,
+        })
+      }
+      return chunks.length <= 1
+        ? await executeReplyDurablePath({ chatId, threadTs, text, blocks, cleanupImages, ctx })
+        : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
+    } catch (durableErr) {
+      if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
+      // Session couldn't go durable — fall through to the best-effort direct
+      // send (the allow event above already stands).
+    }
+  }
+
+  let lastTs = ''
+  try {
+    for (const chunk of chunks) {
+      const res = await ctx.web.chat.postMessage({
+        channel: chatId,
+        text: chunk,
+        // chunks is [text] whenever blocks are set, so this spreads onto exactly
+        // one message.
+        ...(blocks !== undefined ? { blocks: blocks as any } : {}),
+        thread_ts: threadTs,
+        unfurl_links: false,
+        unfurl_media: false,
+      })
+      lastTs = (res.ts as string) || lastTs
+    }
+  } catch (postErr) {
+    await cleanupImages?.()
+    throw postErr
+  }
+
+  // Upload files if provided (shared helper — Gemini #188)
+  if (files && files.length > 0) {
+    await executeReplyFileUploads(files, chatId, threadTs, ctx)
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1620,6 +1727,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const stream: boolean = args.stream === true
   let blocks: Array<Record<string, unknown>> | undefined =
     Array.isArray(args.blocks) && args.blocks.length > 0 ? args.blocks : undefined
+  let cleanupImages: (() => Promise<void>) | undefined
 
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
@@ -1666,7 +1774,9 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     // Local-path images → channel/thread uploads (after every reject above, so
     // a refused reply uploads nothing; before record/send, so a durable
     // obligation stores file ids and redelivery never re-uploads).
-    blocks = await resolveCardImages(blocks, 'reply', { channelId: chatId, threadTs }, ctx)
+    const resolved = await resolveCardImages(blocks, 'reply', { channelId: chatId, threadTs }, ctx)
+    blocks = resolved.blocks
+    cleanupImages = resolved.cleanup
   }
 
   const access = ctx.getAccess()
@@ -1704,51 +1814,17 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // A blocks reply is a single message: text is the notification fallback and
   // is never chunked (Slack renders the blocks, not the text).
   const chunks = blocks !== undefined ? [text] : chunkText(text, limit, mode)
-  const hasFiles = files !== undefined && files.length > 0
-
-  if (!stream && threadTs !== undefined && supervisor !== null) {
-    try {
-      if (hasFiles) {
-        return await executeReplyFileDurablePath({ chatId, threadTs, chunks, files, blocks, ctx })
-      }
-      return chunks.length <= 1
-        ? await executeReplyDurablePath({ chatId, threadTs, text, blocks, ctx })
-        : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
-    } catch (durableErr) {
-      if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
-      // Session couldn't go durable — fall through to the best-effort direct
-      // send (the allow event above already stands).
-    }
-  }
-
-  let lastTs = ''
-  for (const chunk of chunks) {
-    const res = await ctx.web.chat.postMessage({
-      channel: chatId,
-      text: chunk,
-      // chunks is [text] whenever blocks are set, so this spreads onto exactly
-      // one message.
-      ...(blocks !== undefined ? { blocks: blocks as any } : {}),
-      thread_ts: threadTs,
-      unfurl_links: false,
-      unfurl_media: false,
-    })
-    lastTs = (res.ts as string) || lastTs
-  }
-
-  // Upload files if provided (shared helper — Gemini #188)
-  if (files && files.length > 0) {
-    await executeReplyFileUploads(files, chatId, threadTs, ctx)
-  }
-
-  return {
-    content: [
-      {
-        type: 'text',
-        text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
-      },
-    ],
-  }
+  return deliverNonStreamingReply({
+    chatId,
+    threadTs,
+    text,
+    chunks,
+    files,
+    blocks,
+    stream,
+    cleanupImages,
+    ctx,
+  })
 }
 
 // -----------------------------------------------------------------------
@@ -1801,29 +1877,30 @@ async function executeEditMessage(
   args: Record<string, any>,
   ctx: ToolContext,
 ): Promise<ToolResult> {
+  const assertEditOutbound = (threadTs: string | undefined): void => {
+    try {
+      ctx.assertOutboundAllowed(args.chat_id, threadTs)
+    } catch (outboundErr) {
+      ctx.journalWrite({
+        kind: 'gate.outbound.deny',
+        outcome: 'deny',
+        toolName: 'edit_message',
+        sessionKey:
+          threadTs !== undefined ? { channel: args.chat_id, thread: threadTs } : undefined,
+        input: { channel: args.chat_id, thread_ts: threadTs },
+        reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+      })
+      throw outboundErr
+    }
+  }
   // Editing a message engages with the thread that message lives
   // in. Callers that know the thread pass `thread_ts`; otherwise
   // the gate falls back to channel-level opt-in or top-level.
-  try {
-    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
-  } catch (outboundErr) {
-    ctx.journalWrite({
-      kind: 'gate.outbound.deny',
-      outcome: 'deny',
-      toolName: 'edit_message',
-      sessionKey:
-        args.thread_ts !== undefined
-          ? { channel: args.chat_id, thread: args.thread_ts }
-          : undefined,
-      input: { channel: args.chat_id, thread_ts: args.thread_ts },
-      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-    })
-    throw outboundErr
-  }
+  assertEditOutbound(args.thread_ts)
   // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
   // gate.outbound.allow event (a blocked edit was never allowed).
   guardOutboundSecretValues(args.text, 'edit_message', ctx)
-  let blocks: unknown[] | undefined = args.blocks
+  const blocks: unknown[] | undefined = args.blocks
   if (blocks !== undefined) {
     // Same two guards the reply path runs over Block Kit content. Without
     // them the edit path is a bypass: identical payload, no checks.
@@ -1844,29 +1921,44 @@ async function executeEditMessage(
         `edit_message: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
       )
     }
-    blocks = await resolveCardImages(
-      blocks,
-      'edit_message',
-      { channelId: args.chat_id, threadTs: args.thread_ts },
-      ctx,
-    )
+    if (findLocalImageRefs(blocks).length > 0) {
+      await ensureEditIdentity(ctx)
+    }
   }
-  ctx.journalWrite({
-    kind: 'gate.outbound.allow',
-    outcome: 'allow',
-    toolName: 'edit_message',
-    sessionKey:
-      args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
-    input: { channel: args.chat_id, thread_ts: args.thread_ts },
+  await resolveAndApplyEditWithImages({
+    blocks,
+    chatId: args.chat_id,
+    messageId: args.message_id,
+    callerThreadTs: args.thread_ts,
+    identity: { botUserId: ctx.botUserId, selfBotId: ctx.selfBotId },
+    lookupClient: ctx.web as unknown as EditTargetLookupClient,
+    imageDeps: buildCardImageDeps('edit_message', ctx),
+    assertResolvedTargetAllowed: (target) => {
+      if (target.threadTs !== args.thread_ts) assertEditOutbound(target.threadTs)
+    },
+    applyEdit: async (resolvedBlocks, target) => {
+      const effectiveThreadTs = target.threadTs
+      ctx.journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'edit_message',
+        sessionKey:
+          effectiveThreadTs !== undefined
+            ? { channel: args.chat_id, thread: effectiveThreadTs }
+            : undefined,
+        input: { channel: args.chat_id, thread_ts: effectiveThreadTs },
+      })
+      const blocks = resolvedBlocks
+      await ctx.web.chat.update(
+        buildEditMessagePayload({
+          chat_id: args.chat_id,
+          message_id: args.message_id,
+          text: args.text,
+          blocks,
+        }) as never,
+      )
+    },
   })
-  await ctx.web.chat.update(
-    buildEditMessagePayload({
-      chat_id: args.chat_id,
-      message_id: args.message_id,
-      text: args.text,
-      blocks,
-    }) as never,
-  )
   return {
     content: [{ type: 'text', text: `Edited message ${args.message_id}` }],
   }
