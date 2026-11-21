@@ -20566,18 +20566,26 @@ describe('private inline images — findLocalImageRefs / isImageReady', () => {
   })
 })
 
-describe('private inline images — resolvePrivateImageBlocks', () => {
+describe('inline card images — resolvePrivateImageBlocks', () => {
+  const target = { channelId: 'C_CARD', threadTs: '1700000000.000100' }
+
   function fakeDeps(
     opts: {
       readyAfter?: number
       blockPath?: string
       infoThrowsFirst?: boolean
+      uploadErr?: Error
       ids?: string[]
+      deleteErrId?: string
     } = {},
   ) {
     const calls: string[] = []
     const sleeps: number[] = []
-    const uploads: Array<Array<{ filename: string; bytes: number[] }>> = []
+    const deleted: string[] = []
+    const uploads: Array<{
+      target: { channelId: string; threadTs?: string }
+      files: Array<{ filename: string; bytes: number[] }>
+    }> = []
     const polls = new Map<string, number>()
     const deps = {
       readAndGuard: (path: string, filename: string) => {
@@ -20585,9 +20593,16 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
         if (path === opts.blockPath) throw new ExfilBlockedError(`blocked ${filename}`)
         return new Uint8Array([path.length])
       },
-      uploadPrivate: async (files: Array<{ bytes: Uint8Array; filename: string }>) => {
+      uploadMany: async (
+        files: Array<{ bytes: Uint8Array; filename: string }>,
+        dest: { channelId: string; threadTs?: string },
+      ) => {
         calls.push('upload')
-        uploads.push(files.map((f) => ({ filename: f.filename, bytes: Array.from(f.bytes) })))
+        uploads.push({
+          target: dest,
+          files: files.map((f) => ({ filename: f.filename, bytes: Array.from(f.bytes) })),
+        })
+        if (opts.uploadErr) throw opts.uploadErr
         return opts.ids ?? files.map((_, i) => `F${i + 1}`)
       },
       fileInfo: async (id: string) => {
@@ -20597,11 +20612,16 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
         if (opts.infoThrowsFirst && n === 1) throw new Error('rate_limited')
         return n > (opts.readyAfter ?? 0) ? { id, original_w: 10 } : { id }
       },
+      deleteFile: async (id: string) => {
+        calls.push(`delete:${id}`)
+        deleted.push(id)
+        if (opts.deleteErrId === id) throw new Error(`delete_failed:${id}`)
+      },
       sleep: async (ms: number) => {
         sleeps.push(ms)
       },
     }
-    return { deps, calls, sleeps, uploads }
+    return { deps, calls, sleeps, uploads, deleted }
   }
   const card = (): Array<Record<string, unknown>> => [
     { type: 'section', text: { type: 'mrkdwn', text: '*Board*' } },
@@ -20617,21 +20637,24 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls } = fakeDeps()
     const blocks = [{ type: 'image', slack_file: { id: 'F_OLD' }, alt_text: 'x' }]
-    expect(await resolvePrivateImageBlocks(blocks, deps)).toBe(blocks)
+    expect(await resolvePrivateImageBlocks(blocks, deps, target)).toBe(blocks)
     expect(calls).toEqual([])
   })
 
-  test('guards every file first, uploads once privately in order, swaps in ids, dedups paths', async () => {
+  test('guards every file first, uploads once to card channel+thread in order, swaps in ids, dedups paths', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls, uploads } = fakeDeps()
     const input = card()
-    const out = await resolvePrivateImageBlocks(input, deps)
+    const out = await resolvePrivateImageBlocks(input, deps, target)
     expect(calls).toEqual(['guard:one.png', 'guard:two.png', 'upload', 'info:F1', 'info:F2'])
     expect(uploads).toEqual([
-      [
-        { filename: 'one.png', bytes: [10] },
-        { filename: 'two.png', bytes: [10] },
-      ],
+      {
+        target,
+        files: [
+          { filename: 'one.png', bytes: [10] },
+          { filename: 'two.png', bytes: [10] },
+        ],
+      },
     ])
     expect(out[1]).toEqual({ type: 'image', slack_file: { id: 'F1' }, alt_text: 'one' })
     expect(out[2]).toEqual({ type: 'image', slack_file: { id: 'F2' }, alt_text: 'two' })
@@ -20647,8 +20670,26 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
   test('a blocked file uploads nothing and the error propagates', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
     const { deps, calls } = fakeDeps({ blockPath: '/r/two.png' })
-    await expect(resolvePrivateImageBlocks(card(), deps)).rejects.toBeInstanceOf(ExfilBlockedError)
+    await expect(resolvePrivateImageBlocks(card(), deps, target)).rejects.toBeInstanceOf(
+      ExfilBlockedError,
+    )
     expect(calls).toEqual(['guard:one.png', 'guard:two.png'])
+  })
+
+  test('an upload failure propagates without polling, so the card is never posted', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const { deps, calls } = fakeDeps({ uploadErr: new Error('not_in_channel') })
+    await expect(resolvePrivateImageBlocks(card(), deps, target)).rejects.toThrow(/not_in_channel/)
+    expect(calls).toEqual(['guard:one.png', 'guard:two.png', 'upload'])
+  })
+
+  test('missing channelId fails before reading or uploading anything', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const { deps, calls } = fakeDeps()
+    await expect(resolvePrivateImageBlocks(card(), deps, { channelId: '' })).rejects.toThrow(
+      /channelId/,
+    )
+    expect(calls).toEqual([])
   })
 
   test('waits with backoff until Slack has processed the file, then returns', async () => {
@@ -20657,7 +20698,7 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     const spec: Array<Record<string, unknown>> = [
       { type: 'image', slack_file: { path: '/r/one.png' }, alt_text: 'x' },
     ]
-    const out = await resolvePrivateImageBlocks(spec, deps)
+    const out = await resolvePrivateImageBlocks(spec, deps, target)
     expect(calls.filter((c) => c.startsWith('info:'))).toHaveLength(3)
     expect(sleeps).toEqual([250, 500])
     expect(out[0]).toEqual({ type: 'image', slack_file: { id: 'F1' }, alt_text: 'x' })
@@ -20669,17 +20710,19 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
     await resolvePrivateImageBlocks(
       [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
       deps,
+      target,
     )
     expect(sleeps).toEqual([250])
   })
 
-  test('never ready within the budget: throws, so the card is never posted', async () => {
+  test('never ready within the budget: deletes uploaded shares and throws, so the card is never posted', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
-    const { deps, sleeps } = fakeDeps({ readyAfter: 1_000 })
+    const { deps, sleeps, deleted } = fakeDeps({ readyAfter: 1_000 })
     await expect(
       resolvePrivateImageBlocks(
         [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
         deps,
+        target,
         {
           pollDelaysMs: [100, 200],
           maxWaitMs: 700,
@@ -20687,40 +20730,112 @@ describe('private inline images — resolvePrivateImageBlocks', () => {
       ),
     ).rejects.toThrow(/not processed by Slack within 700ms; the card was not posted/)
     expect(sleeps).toEqual([100, 200, 200, 200])
+    expect(deleted).toEqual(['F1'])
   })
 
-  test('an upload with a missing id fails instead of posting a broken block', async () => {
+  test('an upload with a missing id deletes already-uploaded sibling shares and fails', async () => {
     const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
-    const { deps } = fakeDeps({ ids: [''] })
+    const { deps, deleted } = fakeDeps({ ids: ['F1', ''] })
+    await expect(resolvePrivateImageBlocks(card(), deps, target)).rejects.toThrow(
+      /no file id for two\.png/,
+    )
+    expect(deleted).toEqual(['F1'])
+  })
+
+  test('withResolvedImageBlocks: rejected post/edit deletes newly uploaded shares, spares existing slack_file ids, and preserves original error', async () => {
+    const { withResolvedImageBlocks } = await import('./private-image-blocks.ts')
+    const { deps, deleted } = fakeDeps({ deleteErrId: 'F1' })
+    const mixed = [
+      { type: 'image', slack_file: { id: 'F_EXISTING' }, alt_text: 'pre-existing' },
+      ...card(),
+    ]
     await expect(
-      resolvePrivateImageBlocks(
-        [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }],
-        deps,
-      ),
-    ).rejects.toThrow(/no file id for a\.png/)
+      withResolvedImageBlocks(mixed, deps, target, async () => {
+        throw new Error('invalid_blocks')
+      }),
+    ).rejects.toThrow(/invalid_blocks/)
+    // F1 threw during delete, yet F2 was still cleaned up and F_EXISTING was untouched.
+    expect(deleted).toEqual(['F1', 'F2'])
+  })
+
+  test('withResolvedImageBlocks: succeeding send does not delete uploaded shares; cleanup is idempotent', async () => {
+    const { resolveImageBlocksWithCleanup, withResolvedImageBlocks } = await import(
+      './private-image-blocks.ts'
+    )
+    const a = fakeDeps()
+    const res = await withResolvedImageBlocks(card(), a.deps, target, async (blocks) => blocks)
+    expect(res[1]).toEqual({ type: 'image', slack_file: { id: 'F1' }, alt_text: 'one' })
+    expect(a.deleted).toEqual([])
+
+    const b = fakeDeps()
+    const resolved = await resolveImageBlocksWithCleanup(card(), b.deps, target)
+    expect(resolved.uploadedIds).toEqual(['F1', 'F2'])
+    await resolved.cleanup()
+    await resolved.cleanup()
+    expect(b.deleted).toEqual(['F1', 'F2'])
+
+    const noLocal = await resolveImageBlocksWithCleanup(
+      [{ type: 'image', slack_file: { id: 'F_OLD' }, alt_text: 'x' }],
+      b.deps,
+      target,
+    )
+    expect(noLocal.uploadedIds).toEqual([])
+    await noLocal.cleanup()
+    expect(b.deleted).toEqual(['F1', 'F2'])
   })
 })
 
-describe('private inline images — createPrivateImageDeps (Slack adapter)', () => {
-  function make(opts: { sendableErr?: Error; contentErr?: Error } = {}) {
+describe('inline card images — createPrivateImageDeps (Slack adapter)', () => {
+  function make(
+    opts: {
+      sendableErr?: Error
+      contentErr?: Error
+      uploadErr?: Error
+      ready?: boolean
+      readyAfterUploads?: number
+    } = {},
+  ) {
     const uploadCalls: Array<Record<string, unknown>> = []
     const infoCalls: string[] = []
+    const deleteCalls: string[] = []
+    const activeShares = new Set<string>()
     const journaled: string[] = []
+    let nextId = 0
     const client = {
       filesUploadV2: async (args: Record<string, unknown>) => {
         uploadCalls.push(args)
-        return { ok: true, files: [{ ok: true, files: [{ id: 'F_A' }, { id: 'F_B' }] }] }
+        if (opts.uploadErr) throw opts.uploadErr
+        const batch = (args.file_uploads as Array<unknown>).map(() => {
+          nextId += 1
+          const id = nextId === 1 ? 'F_A' : nextId === 2 ? 'F_B' : `F_${nextId}`
+          activeShares.add(id)
+          return { id }
+        })
+        return { ok: true, files: [{ ok: true, files: batch }] }
       },
       files: {
         info: async (args: { file: string }) => {
           infoCalls.push(args.file)
-          return { file: { id: args.file, original_w: 5 } }
+          const readyNow =
+            opts.readyAfterUploads !== undefined
+              ? uploadCalls.length > opts.readyAfterUploads
+              : opts.ready !== false
+          return {
+            file: readyNow ? { id: args.file, original_w: 5 } : { id: args.file },
+          }
+        },
+        delete: async (args: { file: string }) => {
+          deleteCalls.push(args.file)
+          activeShares.delete(args.file)
+          return { ok: true }
         },
       },
     }
     return {
       uploadCalls,
       infoCalls,
+      deleteCalls,
+      activeShares,
       journaled,
       deps: createPrivateImageDeps({
         client,
@@ -20732,24 +20847,86 @@ describe('private inline images — createPrivateImageDeps (Slack adapter)', () 
         },
         journalExfilBlock: (r) => journaled.push(r),
         readFile: () => new Uint8Array([1, 2]),
+        sleep: async () => {},
       }),
     }
   }
 
-  test('uploadPrivate: ONE call, files in order, and NO channel / thread (never shared)', async () => {
+  test('uploadMany: ONE call, files in order, carries channel_id + thread_ts of the card', async () => {
     const { deps, uploadCalls } = make()
-    const ids = await deps.uploadPrivate([
-      { bytes: new Uint8Array([1]), filename: 'a.png' },
-      { bytes: new Uint8Array([2]), filename: 'b.png' },
-    ])
+    const ids = await deps.uploadMany(
+      [
+        { bytes: new Uint8Array([1]), filename: 'a.png' },
+        { bytes: new Uint8Array([2]), filename: 'b.png' },
+      ],
+      { channelId: 'C_CARD', threadTs: '1700000000.000100' },
+    )
     expect(ids).toEqual(['F_A', 'F_B'])
     expect(uploadCalls).toHaveLength(1)
     const call = uploadCalls[0] as Record<string, unknown>
-    expect(Object.keys(call)).toEqual(['file_uploads'])
+    expect(call.channel_id).toBe('C_CARD')
+    expect(call.thread_ts).toBe('1700000000.000100')
     expect((call.file_uploads as Array<{ filename: string }>).map((f) => f.filename)).toEqual([
       'a.png',
       'b.png',
     ])
+  })
+
+  test('uploadMany: top-level card (no threadTs) sets channel_id and omits thread_ts', async () => {
+    const { deps, uploadCalls } = make()
+    const ids = await deps.uploadMany([{ bytes: new Uint8Array([1]), filename: 'a.png' }], {
+      channelId: 'C_CARD',
+    })
+    expect(ids).toEqual(['F_A'])
+    expect(uploadCalls).toHaveLength(1)
+    const call = uploadCalls[0] as Record<string, unknown>
+    expect(call.channel_id).toBe('C_CARD')
+    expect('thread_ts' in call).toBe(false)
+  })
+
+  test('uploadMany: rejects empty channelId without calling filesUploadV2', async () => {
+    const { deps, uploadCalls } = make()
+    await expect(
+      deps.uploadMany([{ bytes: new Uint8Array([1]), filename: 'a.png' }], { channelId: '' }),
+    ).rejects.toThrow(/channelId/)
+    expect(uploadCalls).toHaveLength(0)
+  })
+
+  test('end-to-end: processing timeout cleans up the share and retry leaves a single share (no duplicate)', async () => {
+    const { withResolvedImageBlocks } = await import('./private-image-blocks.ts')
+    let posted = 0
+    const postCard = async (deps: ReturnType<typeof createPrivateImageDeps>) =>
+      withResolvedImageBlocks(
+        [{ type: 'image', slack_file: { path: '/r/a.png' }, alt_text: 'x' }] as Array<
+          Record<string, unknown>
+        >,
+        deps,
+        { channelId: 'C_CARD', threadTs: '1700000000.000100' },
+        async (blocks) => {
+          posted += 1
+          return blocks
+        },
+        { pollDelaysMs: [10], maxWaitMs: 25 },
+      )
+
+    const failUpload = make({ uploadErr: new Error('channel_not_found') })
+    await expect(postCard(failUpload.deps)).rejects.toThrow(/channel_not_found/)
+    expect(posted).toBe(0)
+    expect(failUpload.uploadCalls[0]?.channel_id).toBe('C_CARD')
+    expect(failUpload.uploadCalls[0]?.thread_ts).toBe('1700000000.000100')
+    expect([...failUpload.activeShares]).toEqual([])
+
+    // First attempt times out → deletes F_A so no orphan share remains; retry uploads F_B and posts once.
+    const retryFlow = make({ readyAfterUploads: 1 })
+    await expect(postCard(retryFlow.deps)).rejects.toThrow(/not processed by Slack/)
+    expect(posted).toBe(0)
+    expect(retryFlow.deleteCalls).toEqual(['F_A'])
+    expect([...retryFlow.activeShares]).toEqual([])
+
+    const postedBlocks = await postCard(retryFlow.deps)
+    expect(posted).toBe(1)
+    expect(postedBlocks[0]).toEqual({ type: 'image', slack_file: { id: 'F_B' }, alt_text: 'x' })
+    expect([...retryFlow.activeShares]).toEqual(['F_B'])
   })
 
   test('readAndGuard: a path block or a secret in the bytes is journaled and thrown', async () => {
@@ -20761,10 +20938,413 @@ describe('private inline images — createPrivateImageDeps (Slack adapter)', () 
     expect(b.journaled).toEqual(['secret value'])
   })
 
-  test('fileInfo reads files.info', async () => {
-    const { deps, infoCalls } = make()
+  test('fileInfo reads files.info and deleteFile calls files.delete', async () => {
+    const { deps, infoCalls, deleteCalls } = make()
     expect(await deps.fileInfo('F_A')).toEqual({ id: 'F_A', original_w: 5 })
     expect(infoCalls).toEqual(['F_A'])
+    await deps.deleteFile('F_A')
+    expect(deleteCalls).toEqual(['F_A'])
+  })
+})
+
+describe('inline card images — edit_message target resolution and rollback', () => {
+  const identity = { botUserId: 'U_BOT', selfBotId: 'B_SELF' }
+
+  function makeEditHarness(
+    opts: {
+      messages?: Array<{
+        ts?: string
+        thread_ts?: string
+        channel?: string
+        user?: string
+        bot_id?: string
+        subtype?: string
+        hidden?: boolean
+      }>
+      repliesErr?: Error
+      ready?: boolean
+      readyAfterUploads?: number
+      updateErr?: Error
+    } = {},
+  ) {
+    const repliesCalls: Array<Record<string, unknown>> = []
+    const uploadCalls: Array<Record<string, unknown>> = []
+    const deleteCalls: string[] = []
+    const updateCalls: Array<{
+      blocks: unknown
+      target: { channelId: string; threadTs?: string }
+    }> = []
+    const activeShares = new Set<string>()
+    let nextId = 0
+    const client = {
+      conversations: {
+        replies: async (args: Record<string, unknown>) => {
+          repliesCalls.push(args)
+          if (opts.repliesErr) throw opts.repliesErr
+          return { messages: opts.messages ?? [] }
+        },
+      },
+      filesUploadV2: async (args: Record<string, unknown>) => {
+        uploadCalls.push(args)
+        const batch = (args.file_uploads as Array<unknown>).map(() => {
+          nextId += 1
+          const id = `F_EDIT_${nextId}`
+          activeShares.add(id)
+          return { id }
+        })
+        return { ok: true, files: [{ ok: true, files: batch }] }
+      },
+      files: {
+        info: async (args: { file: string }) => {
+          const readyNow =
+            opts.readyAfterUploads !== undefined
+              ? uploadCalls.length > opts.readyAfterUploads
+              : opts.ready !== false
+          return { file: readyNow ? { id: args.file, original_w: 12 } : { id: args.file } }
+        },
+        delete: async (args: { file: string }) => {
+          deleteCalls.push(args.file)
+          activeShares.delete(args.file)
+          return { ok: true }
+        },
+      },
+    }
+    const imageDeps = createPrivateImageDeps({
+      client,
+      assertSendable: () => {},
+      assertNoSecretValues: () => {},
+      journalExfilBlock: () => {},
+      readFile: () => new Uint8Array([9, 9]),
+      sleep: async () => {},
+    })
+    const applyEdit = async (blocks: unknown, target: { channelId: string; threadTs?: string }) => {
+      if (opts.updateErr) throw opts.updateErr
+      updateCalls.push({ blocks, target })
+      return 'updated'
+    }
+    return {
+      client,
+      imageDeps,
+      applyEdit,
+      repliesCalls,
+      uploadCalls,
+      deleteCalls,
+      updateCalls,
+      activeShares,
+    }
+  }
+
+  const localImageBlocks = () => [
+    { type: 'image', slack_file: { path: '/r/chart.png' }, alt_text: 'chart' },
+  ]
+
+  test('threaded edit with omitted thread_ts resolves real parent and shares image into that thread (not channel root)', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0002', thread_ts: '1700.0001', user: 'U_BOT' }],
+    })
+    const res = await resolveAndApplyEditWithImages({
+      blocks: localImageBlocks(),
+      chatId: 'C_CARD',
+      messageId: '1700.0002',
+      callerThreadTs: undefined,
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(res).toBe('updated')
+    expect(h.repliesCalls).toEqual([
+      {
+        channel: 'C_CARD',
+        ts: '1700.0002',
+        oldest: '1700.0002',
+        latest: '1700.0002',
+        inclusive: true,
+        limit: 1,
+      },
+    ])
+    expect(h.uploadCalls).toHaveLength(1)
+    expect(h.uploadCalls[0]?.channel_id).toBe('C_CARD')
+    expect(h.uploadCalls[0]?.thread_ts).toBe('1700.0001')
+    expect(h.updateCalls).toEqual([
+      {
+        blocks: [{ type: 'image', slack_file: { id: 'F_EDIT_1' }, alt_text: 'chart' }],
+        target: { channelId: 'C_CARD', threadTs: '1700.0001' },
+      },
+    ])
+    expect([...h.activeShares]).toEqual(['F_EDIT_1'])
+  })
+
+  test('threaded edit with matching caller thread_ts succeeds (including bot_id ownership)', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0002', thread_ts: '1700.0001', bot_id: 'B_SELF' }],
+    })
+    await resolveAndApplyEditWithImages({
+      blocks: localImageBlocks(),
+      chatId: 'C_CARD',
+      messageId: '1700.0002',
+      callerThreadTs: '1700.0001',
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(h.uploadCalls[0]?.channel_id).toBe('C_CARD')
+    expect(h.uploadCalls[0]?.thread_ts).toBe('1700.0001')
+    expect(h.updateCalls).toHaveLength(1)
+  })
+
+  test('threaded edit with mismatched thread_ts fails closed with zero uploads and zero card updates', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0002', thread_ts: '1700.0001', user: 'U_BOT' }],
+    })
+    await expect(
+      resolveAndApplyEditWithImages({
+        blocks: localImageBlocks(),
+        chatId: 'C_CARD',
+        messageId: '1700.0002',
+        callerThreadTs: '1700.9999',
+        identity,
+        lookupClient: h.client,
+        imageDeps: h.imageDeps,
+        applyEdit: h.applyEdit,
+      }),
+    ).rejects.toThrow(/does not match target card 1700\.0002's thread 1700\.0001/)
+    expect(h.uploadCalls).toHaveLength(0)
+    expect(h.updateCalls).toHaveLength(0)
+  })
+
+  test('genuine top-level edit shares image at channel root (omits thread_ts)', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0001', user: 'U_BOT' }],
+    })
+    await resolveAndApplyEditWithImages({
+      blocks: localImageBlocks(),
+      chatId: 'C_CARD',
+      messageId: '1700.0001',
+      callerThreadTs: undefined,
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(h.uploadCalls).toHaveLength(1)
+    expect(h.uploadCalls[0]?.channel_id).toBe('C_CARD')
+    expect('thread_ts' in (h.uploadCalls[0] ?? {})).toBe(false)
+    expect(h.updateCalls[0]?.target).toEqual({ channelId: 'C_CARD' })
+  })
+
+  test('top-level edit with spurious caller thread_ts fails closed with zero uploads', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0001', user: 'U_BOT' }],
+    })
+    await expect(
+      resolveAndApplyEditWithImages({
+        blocks: localImageBlocks(),
+        chatId: 'C_CARD',
+        messageId: '1700.0001',
+        callerThreadTs: '1700.9999',
+        identity,
+        lookupClient: h.client,
+        imageDeps: h.imageDeps,
+        applyEdit: h.applyEdit,
+      }),
+    ).rejects.toThrow(/is a top-level message/)
+    expect(h.uploadCalls).toHaveLength(0)
+    expect(h.updateCalls).toHaveLength(0)
+  })
+
+  test('thread-parent card (ts === thread_ts) with omitted thread_ts shares into its own thread', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0001', thread_ts: '1700.0001', user: 'U_BOT' }],
+    })
+    await resolveAndApplyEditWithImages({
+      blocks: localImageBlocks(),
+      chatId: 'C_CARD',
+      messageId: '1700.0001',
+      callerThreadTs: undefined,
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(h.uploadCalls[0]?.thread_ts).toBe('1700.0001')
+  })
+
+  test('fails closed before uploading when card cannot be verified or is not editable by this bot', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const cases: Array<{
+      label: string
+      chatId?: string
+      messageId?: string
+      id?: { botUserId: string; selfBotId: string }
+      harness: ReturnType<typeof makeEditHarness>
+      match: RegExp
+    }> = [
+      {
+        label: 'empty messageId',
+        messageId: '',
+        harness: makeEditHarness(),
+        match: /chat_id and message_id are required/,
+      },
+      {
+        label: 'unresolved bot identity',
+        id: { botUserId: '', selfBotId: '' },
+        harness: makeEditHarness(),
+        match: /bot identity is not resolved/,
+      },
+      {
+        label: 'Slack lookup error',
+        harness: makeEditHarness({ repliesErr: new Error('thread_not_found') }),
+        match: /failed to verify target card.*thread_not_found/,
+      },
+      {
+        label: 'target ts missing',
+        harness: makeEditHarness({ messages: [{ ts: '1700.9999', user: 'U_BOT' }] }),
+        match: /was not found/,
+      },
+      {
+        label: 'wrong channel on message',
+        harness: makeEditHarness({
+          messages: [{ ts: '1700.0002', channel: 'C_OTHER', user: 'U_BOT' }],
+        }),
+        match: /belongs to channel C_OTHER/,
+      },
+      {
+        label: 'tombstoned message',
+        harness: makeEditHarness({
+          messages: [{ ts: '1700.0002', subtype: 'tombstone', user: 'U_BOT' }],
+        }),
+        match: /deleted or hidden/,
+      },
+      {
+        label: 'hidden message',
+        harness: makeEditHarness({
+          messages: [{ ts: '1700.0002', hidden: true, user: 'U_BOT' }],
+        }),
+        match: /deleted or hidden/,
+      },
+      {
+        label: 'message owned by human / other bot',
+        harness: makeEditHarness({
+          messages: [{ ts: '1700.0002', user: 'U_HUMAN', bot_id: 'B_OTHER' }],
+        }),
+        match: /not authored by this bot/,
+      },
+    ]
+    for (const c of cases) {
+      await expect(
+        resolveAndApplyEditWithImages({
+          blocks: localImageBlocks(),
+          chatId: c.chatId ?? 'C_CARD',
+          messageId: c.messageId ?? '1700.0002',
+          identity: c.id ?? identity,
+          lookupClient: c.harness.client,
+          imageDeps: c.harness.imageDeps,
+          applyEdit: c.harness.applyEdit,
+        }),
+      ).rejects.toThrow(c.match)
+      expect(c.harness.uploadCalls).toHaveLength(0)
+      expect(c.harness.updateCalls).toHaveLength(0)
+    }
+  })
+
+  test('fails closed before uploading when resolved thread is denied by outbound gate', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0002', thread_ts: '1700.0001', user: 'U_BOT' }],
+    })
+    await expect(
+      resolveAndApplyEditWithImages({
+        blocks: localImageBlocks(),
+        chatId: 'C_CARD',
+        messageId: '1700.0002',
+        identity,
+        lookupClient: h.client,
+        imageDeps: h.imageDeps,
+        assertResolvedTargetAllowed: () => {
+          throw new Error('Outbound gate: denied resolved thread')
+        },
+        applyEdit: h.applyEdit,
+      }),
+    ).rejects.toThrow(/Outbound gate: denied resolved thread/)
+    expect(h.uploadCalls).toHaveLength(0)
+    expect(h.updateCalls).toHaveLength(0)
+  })
+
+  test('rejected chat.update cleans up uploaded share (no orphan) and retry leaves a single share', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness({
+      messages: [{ ts: '1700.0002', thread_ts: '1700.0001', user: 'U_BOT' }],
+    })
+    let shouldFailUpdate = true
+    const runEdit = () =>
+      resolveAndApplyEditWithImages({
+        blocks: localImageBlocks(),
+        chatId: 'C_CARD',
+        messageId: '1700.0002',
+        identity,
+        lookupClient: h.client,
+        imageDeps: h.imageDeps,
+        applyEdit: async (blocks, target) => {
+          if (shouldFailUpdate) throw new Error('cant_update_message')
+          return h.applyEdit(blocks, target)
+        },
+      })
+
+    await expect(runEdit()).rejects.toThrow(/cant_update_message/)
+    expect(h.updateCalls).toHaveLength(0)
+    expect(h.deleteCalls).toEqual(['F_EDIT_1'])
+    expect([...h.activeShares]).toEqual([])
+
+    shouldFailUpdate = false
+    await runEdit()
+    expect(h.updateCalls).toHaveLength(1)
+    expect(h.updateCalls[0]?.blocks).toEqual([
+      { type: 'image', slack_file: { id: 'F_EDIT_2' }, alt_text: 'chart' },
+    ])
+    expect([...h.activeShares]).toEqual(['F_EDIT_2'])
+  })
+
+  test('edits without local-path images skip conversations.replies lookup and pass caller thread_ts through', async () => {
+    const { resolveAndApplyEditWithImages } = await import('./private-image-blocks.ts')
+    const h = makeEditHarness()
+    await resolveAndApplyEditWithImages({
+      blocks: [{ type: 'image', slack_file: { id: 'F_EXISTING' }, alt_text: 'existing' }],
+      chatId: 'C_CARD',
+      messageId: '1700.0002',
+      callerThreadTs: '1700.0001',
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(h.repliesCalls).toHaveLength(0)
+    expect(h.uploadCalls).toHaveLength(0)
+    expect(h.updateCalls).toEqual([
+      {
+        blocks: [{ type: 'image', slack_file: { id: 'F_EXISTING' }, alt_text: 'existing' }],
+        target: { channelId: 'C_CARD', threadTs: '1700.0001' },
+      },
+    ])
+
+    await resolveAndApplyEditWithImages({
+      blocks: undefined,
+      chatId: 'C_CARD',
+      messageId: '1700.0002',
+      identity,
+      lookupClient: h.client,
+      imageDeps: h.imageDeps,
+      applyEdit: h.applyEdit,
+    })
+    expect(h.repliesCalls).toHaveLength(0)
+    expect(h.updateCalls[1]).toEqual({ blocks: undefined, target: { channelId: 'C_CARD' } })
   })
 })
 
@@ -20834,19 +21414,32 @@ describe('ordered multi-file reply — Slack adapter', () => {
     expect(body).toContain('file_uploads: uploads')
   })
 
-  test('reply and edit_message resolve local-path images after the reserved-id check', () => {
+  test('reply and edit_message resolve local-path images with card channel+thread and failure rollback after the reserved-id check', () => {
     const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-    for (const [fn, tool] of [
-      ['async function executeReply(', 'reply'],
-      ['async function executeEditMessage(', 'edit_message'],
+    for (const [fn, callPattern, postPattern] of [
+      [
+        'async function executeReply(',
+        /const resolved = await resolveCardImages\(\s*blocks,\s*'reply',\s*\{\s*channelId: chatId,\s*threadTs\s*\},\s*ctx,?\s*\)/,
+        /deliverNonStreamingReply\(/,
+      ],
+      [
+        'async function executeEditMessage(',
+        /await resolveAndApplyEditWithImages\(/,
+        /ctx\.web\.chat\.update\(/,
+      ],
     ] as const) {
       const start = src.indexOf(fn)
       const body = src.slice(start, src.indexOf('\n}\n', start))
       const reserved = body.indexOf('findReservedActionId(blocks)')
-      const resolved = body.indexOf(`blocks = await resolveCardImages(blocks, '${tool}', ctx)`)
+      const resolved = body.search(callPattern)
+      const posted = body.search(postPattern)
       expect(reserved).toBeGreaterThan(-1)
       expect(resolved).toBeGreaterThan(reserved)
+      expect(posted).toBeGreaterThan(resolved)
     }
+    const deliverStart = src.indexOf('async function deliverNonStreamingReply(')
+    const deliverBody = src.slice(deliverStart, src.indexOf('\n}\n', deliverStart))
+    expect(deliverBody).toContain('await cleanupImages?.()')
   })
 })
 
