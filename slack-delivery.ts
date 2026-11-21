@@ -556,6 +556,28 @@ export type DurableFileDeliveryResult =
  *  Throws `DurableUnavailableError` BEFORE recording if the session can't be
  *  activated or holds no lease — the caller falls back to the best-effort direct
  *  path. */
+/** Notification text for a blocks message whose own text is empty: the image
+ *  alt texts (`[image: a.png, b.gif]`), else a neutral word. */
+export function blocksFallbackText(blocks: ReadonlyArray<Record<string, unknown>>): string {
+  const names = blocks
+    .filter((b) => b?.type === 'image')
+    .map((b) => String(b.alt_text ?? 'image'))
+  return names.length > 0 ? `[image: ${names.join(', ')}]` : '(message)'
+}
+
+/** A blocks reply ALWAYS keeps one text obligation — the blocks ride on the
+ *  first one — even when its text is empty (PR #8 review item 3: an empty-text
+ *  reply with an image card and another file lost the card). Without blocks the
+ *  chunks are returned as given. */
+function textChunksForBlocks(
+  chunks: readonly string[],
+  blocks: ReadonlyArray<Record<string, unknown>> | undefined,
+): string[] {
+  if (blocks === undefined) return [...chunks]
+  const [first = '', ...rest] = chunks
+  return [first.trim() === '' ? blocksFallbackText(blocks) : first, ...rest]
+}
+
 export async function deliverFileReplyDurably(
   deps: { supervisor: SessionSupervisor; post: ReplyPoster; files: FileUploadDeps },
   reply: DurableFileReply,
@@ -574,7 +596,7 @@ export async function deliverFileReplyDurably(
 
   // Text obligations first, then file obligations — recorded (and delivered) in
   // that order so the message lands before its attachments.
-  const textRecords = reply.chunks.map((payload, i) => ({
+  const textRecords = textChunksForBlocks(reply.chunks, reply.blocks).map((payload, i) => ({
     id: `${reply.id}:${i}`,
     channel: reply.channel,
     thread: reply.thread,

@@ -66,6 +66,10 @@ These are the permissions the bot will hold once installed.
    - `files:write` — upload files (used for long replies via `files.upload`)
    - `users:read` — resolve user IDs to display names
 
+   Optional: `channels:read` and `groups:read` add the channel name
+   (`channel_name`) to inbound messages via `conversations.info`. Without them
+   nothing breaks; the name is just left out.
+
 If you miss a scope, the bot will silently fail on whatever feature
 needs it (e.g., reactions won't show without `reactions:write`). Add
 all eight even if you don't think you need a feature yet.
