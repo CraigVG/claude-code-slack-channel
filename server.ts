@@ -115,6 +115,7 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
+import { createPrivateImageDeps, resolvePrivateImageBlocks } from './private-image-blocks.ts'
 import {
   beginDurableStream,
   createDeliverySendDeps,
@@ -125,6 +126,7 @@ import {
   deliverChunkedReplyDurably,
   deliverFileReplyDurably,
   deliverReplyDurably,
+  sendFileGroup,
   sendFileObligation,
 } from './slack-delivery.ts'
 import { type StreamReplyResult, streamReply } from './stream-reply.ts'
@@ -1004,7 +1006,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'object' },
             description:
-              'Slack Block Kit blocks for rich layouts (optional). Sent as a single message. Buttons in an actions block are LIVE: a user click is delivered back to you as an inbound message of the form [button click] "<label>" (value: <value>) with structured meta, so you can offer tappable choices and react to them. Give each button a distinct action_id (any string not starting with "perm:") and a value.',
+              'Slack Block Kit blocks for rich layouts (optional). Sent as a single message. Buttons in an actions block are LIVE: a user click is delivered back to you as an inbound message of the form [button click] "<label>" (value: <value>) with structured meta, so you can offer tappable choices and react to them. Give each button a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is uploaded privately (never shared to the channel), must pass the same path checks as files, and the card posts only once Slack has processed the image.',
           },
           thread_ts: {
             type: 'string',
@@ -1013,7 +1015,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute paths of files to upload (optional)',
+            description:
+              'Absolute paths of files to upload (optional). All files post together as one message, in the order given.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1053,7 +1056,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'object' },
             description:
-              'Slack Block Kit blocks for the edited message (optional). Slack replaces the message wholesale on edit, so a message that was sent WITH blocks must be edited WITH blocks — editing it with text alone deletes its layout and buttons. Pass the full desired block list, not a delta. Buttons stay LIVE after the edit; give each a distinct action_id (any string not starting with "perm:") and a value.',
+              'Slack Block Kit blocks for the edited message (optional). Slack replaces the message wholesale on edit, so a message that was sent WITH blocks must be edited WITH blocks — editing it with text alone deletes its layout and buttons. Pass the full desired block list, not a delta. Buttons stay LIVE after the edit; give each a distinct action_id (any string not starting with "perm:") and a value. Inline images from a local file: use an image block (or image element) with "slack_file": {"path": "/absolute/file.png"} (png/jpg/gif). The file is uploaded privately (never shared to the channel), must pass the same path checks as files, and the card posts only once Slack has processed the image.',
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -1197,6 +1200,24 @@ function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolC
   }
 }
 
+/** Swap local-path image elements (`slack_file: { path }`) for privately
+ *  uploaded Slack files (`slack_file: { id }`), guarded like reply files and
+ *  only once Slack can render them. Returns the blocks unchanged when none
+ *  carry a local path. See private-image-blocks.ts. */
+function resolveCardImages<T>(blocks: T, toolName: string, ctx: ToolContext): Promise<T> {
+  return resolvePrivateImageBlocks(
+    blocks,
+    createPrivateImageDeps({
+      client: ctx.web as unknown as Parameters<typeof createPrivateImageDeps>[0]['client'],
+      assertSendable: ctx.assertSendable,
+      assertNoSecretValues: ctx.assertNoSecretValues,
+      journalExfilBlock: (reason) =>
+        ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName, reason }),
+      readFile: (p) => readFileSync(resolve(p)),
+    }),
+  )
+}
+
 // -----------------------------------------------------------------------
 // reply
 // -----------------------------------------------------------------------
@@ -1215,6 +1236,10 @@ async function executeReplyFileUploads(
   threadTs: string | undefined,
   ctx: ToolContext,
 ): Promise<void> {
+  // Guard EVERY file before uploading any, then upload them as ONE message so
+  // Slack keeps the order given (separate uploads share as separate messages
+  // and can land out of order). A blocked file therefore sends nothing.
+  const uploads: Array<{ file: Buffer; filename: string }> = []
   for (const filePath of files) {
     try {
       ctx.assertSendable(filePath)
@@ -1230,26 +1255,19 @@ async function executeReplyFileUploads(
     const resolved = resolve(filePath)
     // ccsc-z0n.3 — value-exfiltration guard on file *content*: assertSendable
     // blocked secret files by path; this blocks a live secret value embedded in
-    // an otherwise-allowlisted file's body. Read as latin1 so every byte maps
-    // 1:1 to a character (a token is ASCII; no decode can split or drop it).
-    // The filename is checked too — an attacker who can't put the token in the
-    // body might smuggle it as the name.
-    let body: string
-    try {
-      body = readFileSync(resolved, 'latin1')
-    } catch {
-      body = '' // unreadable here → filesUploadV2 surfaces the real error
-    }
-    guardOutboundSecretValues(body, 'reply', ctx)
+    // an otherwise-allowlisted file's body. Read ONCE as bytes; the guard runs
+    // on their latin1 view (every byte maps 1:1 to a char, so a token cannot be
+    // split or dropped) and the same bytes are uploaded. The filename is
+    // checked too — a token could be smuggled in as the name.
+    const bytes = readFileSync(resolved)
+    guardOutboundSecretValues(bytes.toString('latin1'), 'reply', ctx)
     guardOutboundSecretValues(basename(resolved), 'reply', ctx)
-    const uploadArgs: Record<string, any> = {
-      channel_id: chatId,
-      file: resolved,
-      filename: basename(resolved),
-    }
-    if (threadTs) uploadArgs.thread_ts = threadTs
-    await ctx.web.filesUploadV2(uploadArgs as any)
+    uploads.push({ file: bytes, filename: basename(resolved) })
   }
+  if (uploads.length === 0) return
+  const uploadArgs: Record<string, any> = { channel_id: chatId, file_uploads: uploads }
+  if (threadTs) uploadArgs.thread_ts = threadTs
+  await ctx.web.filesUploadV2(uploadArgs as any)
 }
 
 /** ccsc-o7x.6 — record a stream-finalize obligation (full text) if the session
@@ -1585,7 +1603,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
   const stream: boolean = args.stream === true
-  const blocks: Array<Record<string, unknown>> | undefined =
+  let blocks: Array<Record<string, unknown>> | undefined =
     Array.isArray(args.blocks) && args.blocks.length > 0 ? args.blocks : undefined
 
   try {
@@ -1630,6 +1648,10 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
         `reply: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
       )
     }
+    // Local-path images → private uploads (after every reject above, so a
+    // refused reply uploads nothing; before record/send, so a durable
+    // obligation stores file ids and redelivery never re-uploads).
+    blocks = await resolveCardImages(blocks, 'reply', ctx)
   }
 
   const access = ctx.getAccess()
@@ -1786,7 +1808,7 @@ async function executeEditMessage(
   // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
   // gate.outbound.allow event (a blocked edit was never allowed).
   guardOutboundSecretValues(args.text, 'edit_message', ctx)
-  const blocks: unknown[] | undefined = args.blocks
+  let blocks: unknown[] | undefined = args.blocks
   if (blocks !== undefined) {
     // Same two guards the reply path runs over Block Kit content. Without
     // them the edit path is a bypass: identical payload, no checks.
@@ -1807,6 +1829,7 @@ async function executeEditMessage(
         `edit_message: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
       )
     }
+    blocks = await resolveCardImages(blocks, 'edit_message', ctx)
   }
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
@@ -4202,13 +4225,15 @@ async function main(): Promise<void> {
     readFile: (p) => readFileSync(resolve(p)),
     fileSize: (p) => statSync(resolve(p)).size,
   })
-  const outboxSend = (ob: DeliveryObligation): Promise<void> =>
-    ob.upload !== undefined
-      ? sendFileObligation(fileSendDeps, ob).then(() => undefined)
-      : idempotentSend(ob)
+  // A file send returns its Slack file id; the poller persists it as
+  // uploadedFileId (PR #5 delta review), so redelivery dedups exactly.
+  const outboxSend = (ob: DeliveryObligation): Promise<string | void> =>
+    ob.upload !== undefined ? sendFileObligation(fileSendDeps, ob) : idempotentSend(ob)
   const drainOutboxOnce = (): void => {
     void supervisor!
-      .drainOutbox(outboxSend)
+      // PR #5 review: a queued multi-file reply is redelivered as ONE upload
+      // (guard every file, then one filesUploadV2), never file by file.
+      .drainOutbox(outboxSend, { sendGroup: (obs) => sendFileGroup(fileSendDeps, obs) })
       .then((report) => {
         if (report.deadLettered.length > 0) {
           console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)

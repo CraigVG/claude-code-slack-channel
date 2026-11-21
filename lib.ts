@@ -327,6 +327,11 @@ export interface DeliveryObligation {
    *  id — plus a `(filename, size)` thread scan — is the dedup anchor). Absent
    *  until the first successful upload. */
   uploadedFileId?: string
+  /** PR #5 review — the reply this file belongs to, set on every file
+   *  obligation of a reply with 2+ files. The delivery poller redelivers a
+   *  group's pending files TOGETHER (one upload, in record order) so a queued
+   *  multi-file reply still posts as one message. Additive + optional. */
+  uploadGroup?: string
   /** Block Kit blocks for a rich-layout reply. When present the send includes
    *  them in `chat.postMessage` and `payload` doubles as the notification
    *  fallback text. Guarded against secret values at record time (like
@@ -686,6 +691,7 @@ export const SessionSchema = z
               .strict()
               .optional(),
             uploadedFileId: z.string().optional(),
+            uploadGroup: z.string().optional(),
             // Optional Block Kit blocks for a rich-layout reply. Optional so
             // text obligations + older records validate.
             blocks: z.array(z.record(z.string(), z.unknown())).optional(),
