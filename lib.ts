@@ -18,6 +18,20 @@ import {
   DEFAULT_PEER_BOT_RATE_LIMIT,
 } from './peer-bot-rate-limit.ts'
 
+/** Shared pure fetch-input schema: tests exercise the production boundary. */
+export const FetchMessagesInput = z
+  .object({
+    channel: z.string().min(1),
+    // ADR-005: preserve the prior integer domain; the handler retains its cap.
+    limit: z
+      .number()
+      .positive()
+      .refine(Number.isInteger, { message: 'Expected integer' })
+      .optional(),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
 // ---------------------------------------------------------------------------
@@ -631,7 +645,7 @@ export const SessionSchema = z
     createdAt: z.number(),
     lastActiveAt: z.number(),
     ownerId: z.string(),
-    data: z.record(z.unknown()),
+    data: z.record(z.string(), z.unknown()),
     // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
     // session files (written before this field existed) still validate under
     // the outer `.strict()`.
@@ -1821,7 +1835,7 @@ export function sanitizeFilename(name: string): string {
  * forge fields inside the context window.
  *
  * This sanitizer:
- *  - strips ASCII control chars (including \n, \r, \t, \0, DEL)
+ *  - strips C0 (U+0000–U+001F), DEL (U+007F), and C1 (U+0080–U+009F)
  *  - strips tag/attribute delimiters: < > " ' `
  *  - collapses whitespace runs to a single space
  *  - trims
@@ -1834,7 +1848,7 @@ export function sanitizeDisplayName(raw: unknown): string {
   if (typeof raw !== 'string') return 'unknown'
   const cleaned = raw
     // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — strip C0/C1 control chars from untrusted Slack display names before rendering
-    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
     .replace(/[<>"'`]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
@@ -2236,6 +2250,43 @@ export function stripBotMention(text: string, botUserId: string): string {
   const prefix = `<@${botUserId}>`
   if (!text.startsWith(prefix)) return text
   return text.slice(prefix.length).replace(/^\s+/, '')
+}
+
+/** Result of {@link normalizeSelfMentions}. */
+export interface SelfMentionResult {
+  /** Text to deliver to the session. */
+  text: string
+  /** True when the receiving bot is @-mentioned anywhere in the message. */
+  mentionsYou: boolean
+}
+
+/** Normalize the receiving bot's own `<@U_BOT>` mentions in an inbound
+ *  message before it is delivered to the session (H-20261119-055).
+ *
+ *  - A single LEADING self-mention (the command form `<@me> do X`) is
+ *    stripped, as before.
+ *  - Every OTHER self-mention is replaced with `@you`, so a message that
+ *    names several bots keeps its shape: `<@A> and <@B> look` reads as
+ *    `@you and <@B> look` to A and `<@A> and @you look` to B. The old
+ *    global strip deleted every self-mention, so each bot saw only the
+ *    other bot's id and read the message as addressed to someone else.
+ *  - Mentions of other users and bots are left as-is.
+ *  - `mentionsYou` reports whether a self-mention appeared anywhere.
+ *
+ *  Slack may render a mention with a label (`<@U123|name>`); both forms
+ *  are matched. An empty `botUserId` (identity not resolved yet) returns
+ *  the text unchanged with `mentionsYou: false`. */
+export function normalizeSelfMentions(text: string, botUserId: string): SelfMentionResult {
+  // Slack user ids are A-Z/0-9; anything else is not interpolated into a RegExp.
+  if (!/^[A-Z0-9]+$/.test(botUserId)) return { text, mentionsYou: false }
+  const mention = `<@${botUserId}(?:\\|[^>]*)?>`
+  const trimmed = text.trim()
+  if (!new RegExp(mention).test(trimmed)) return { text: trimmed, mentionsYou: false }
+  const out = trimmed
+    .replace(new RegExp(`^${mention}\\s*`), '')
+    .replace(new RegExp(mention, 'g'), '@you')
+    .trim()
+  return { text: out, mentionsYou: true }
 }
 
 // ---------------------------------------------------------------------------
