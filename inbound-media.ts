@@ -478,11 +478,44 @@ export async function fetchInboundImage(
     if (!resp.ok) throw new ImageFetchRefused(`HTTP ${resp.status}`)
     const contentType = (resp.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase()
     if (!RASTER_IMAGE_TYPES.has(contentType)) {
-      throw new ImageFetchRefused(`refused content-type ${contentType || '(none)'}`)
+      // Fixed text: never echo response-header content into an error.
+      throw new ImageFetchRefused('refused content-type (not an allowed raster image)')
     }
     const bytes = await readCapped(resp, maxBytes)
     return { bytes, contentType, finalUrl: url.toString() }
   }
+}
+
+/** A Slack message timestamp: digits, one dot, digits. Anything else is
+ *  refused before it reaches an API call or a file name. */
+export function isSlackTs(ts: unknown): ts is string {
+  return typeof ts === 'string' && /^\d{1,12}\.\d{1,9}$/.test(ts)
+}
+
+/** `conversations.replies` arguments that return the EXACT message
+ *  `messageTs` (PR #8 delta review): a child reply is fetched under its thread
+ *  root and bounded to its own ts; a top-level message is its own root. */
+export function attachmentLookup(
+  channel: string,
+  messageTs: string,
+  threadTs: string | undefined,
+): Record<string, unknown> {
+  if (!isSlackTs(messageTs)) throw new Error('download_attachment: message_id is not a Slack timestamp')
+  if (threadTs !== undefined && !isSlackTs(threadTs)) {
+    throw new Error('download_attachment: thread_ts is not a Slack timestamp')
+  }
+  if (threadTs === undefined || threadTs === messageTs) {
+    return { channel, ts: messageTs, inclusive: true, limit: 1 }
+  }
+  return { channel, ts: threadTs, oldest: messageTs, latest: messageTs, inclusive: true, limit: 10 }
+}
+
+/** The message whose ts is exactly `messageTs`, never "the first result". */
+export function selectTargetMessage<T extends { ts?: unknown }>(
+  messages: readonly T[] | undefined,
+  messageTs: string,
+): T | undefined {
+  return (messages ?? []).find((m) => m.ts === messageTs)
 }
 
 const EXT_BY_TYPE: Record<string, string> = {
