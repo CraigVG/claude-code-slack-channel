@@ -101,6 +101,7 @@ import {
   deliverReplyDurably,
   type FileUploadDeps,
   type ReplyPoster,
+  sendFileGroup,
   sendFileObligation,
 } from './slack-delivery.ts'
 import {
@@ -22437,5 +22438,285 @@ describe('review item 5 — metadata lookups have a deadline and are shared in f
     )
     const rcn = src.slice(src.indexOf('async function resolveChannelName('))
     expect(rcn.slice(0, 1200)).toContain('channelNameFlights.run(')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR #5 review (FIX @13388815de4a, comment 7065161699)
+// ---------------------------------------------------------------------------
+
+describe('PR #5 review (2) — the readiness deadline is wall-clock time', () => {
+  const plain = (n: number) => [
+    ...Array.from({ length: n }, (_, i) => ({
+      type: 'image',
+      slack_file: { path: `/r/${i}.png` },
+      alt_text: `${i}`,
+    })),
+  ]
+  const baseDeps = (fileInfo: (id: string) => Promise<Record<string, unknown> | undefined>) => ({
+    readAndGuard: () => new Uint8Array([1]),
+    async uploadPrivate(files: Array<unknown>) {
+      return files.map((_, i) => `F${i}`)
+    },
+    fileInfo,
+    async sleep() {},
+  })
+
+  test('a READY answer that arrives after the deadline is not accepted', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const t0 = Date.now()
+    const slowReady = () =>
+      new Promise<Record<string, unknown>>((r) => setTimeout(() => r({ original_w: 10 }), 80))
+    await expect(
+      resolvePrivateImageBlocks(plain(1), baseDeps(slowReady), { maxWaitMs: 20 }),
+    ).rejects.toThrow(/not processed by Slack within 20ms/)
+    expect(Date.now() - t0).toBeLessThan(75)
+  })
+
+  test('a stalled files.info call cannot hold the reply past the deadline', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const t0 = Date.now()
+    await expect(
+      resolvePrivateImageBlocks(
+        plain(1),
+        baseDeps(() => new Promise(() => {})),
+        { maxWaitMs: 30 },
+      ),
+    ).rejects.toThrow(/not processed by Slack/)
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
+
+  test('the budget covers ALL images together, not each one', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    // Each image is ready after ~25 ms; three in turn need ~75 ms > 50 ms budget.
+    const ready25 = () =>
+      new Promise<Record<string, unknown>>((r) => setTimeout(() => r({ original_w: 10 }), 25))
+    await expect(
+      resolvePrivateImageBlocks(plain(3), baseDeps(ready25), { maxWaitMs: 50 }),
+    ).rejects.toThrow(/not processed by Slack/)
+    // ... and a quick answer inside the budget still resolves.
+    const quick = async () => ({ original_w: 10 })
+    const out = await resolvePrivateImageBlocks(plain(3), baseDeps(quick), { maxWaitMs: 50 })
+    expect(out.map((b) => b.slack_file as unknown)).toEqual([
+      { id: 'F0' },
+      { id: 'F1' },
+      { id: 'F2' },
+    ])
+  })
+
+  test('no files.info call is made once the deadline has passed', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    // Injected clock: the deadline is set at t=0 (+50); the first poll already sees t=100.
+    const times = [0, 100, 100, 100]
+    let calls = 0
+    const deps = {
+      ...baseDeps(async () => {
+        calls++
+        return { original_w: 10 }
+      }),
+      now: () => times.shift() ?? 100,
+    }
+    await expect(resolvePrivateImageBlocks(plain(1), deps, { maxWaitMs: 50 })).rejects.toThrow(
+      /not processed by Slack within 50ms/,
+    )
+    expect(calls).toBe(0)
+  })
+
+  test('slow sleeps count too: the poll stops once real time is spent', async () => {
+    const { resolvePrivateImageBlocks } = await import('./private-image-blocks.ts')
+    const t0 = Date.now()
+    const deps = {
+      ...baseDeps(async () => undefined),
+      sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms * 40)),
+    }
+    await expect(
+      resolvePrivateImageBlocks(plain(1), deps, { maxWaitMs: 60, pollDelaysMs: [5] }),
+    ).rejects.toThrow(/not processed by Slack/)
+    // One fake sleep takes 200 ms; the wall-clock deadline must cut it at ~60.
+    expect(Date.now() - t0).toBeLessThan(150)
+  })
+})
+
+describe('PR #5 review (1) — queued multi-file replies stay together on redelivery', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  const key = { channel: 'C_GRP', thread: 'T1' }
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-grp-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => rmSync(rawRoot, { recursive: true, force: true }))
+  const makeSupervisor = () =>
+    createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => 1_700_000_000_000,
+      leaseTtlMs: 60_000,
+      ownerId: 'OWNER-1',
+    })
+  const rateLimited = () =>
+    Object.assign(new Error('slack: rate_limited'), { data: { ok: false, error: 'rate_limited' } })
+  const reply = {
+    id: 'g-1',
+    channel: 'C_GRP',
+    thread: 'T1',
+    chunks: ['three shots'],
+    files: ['a.png', 'b.png', 'c.png'].map((f) => ({ path: `/r/${f}`, filename: f })),
+  }
+  function makeFileDeps(opts: { failFirst?: boolean; blockName?: string } = {}) {
+    const calls: string[] = []
+    let failed = false
+    const deps: FileUploadDeps = {
+      readAndGuard: async (u) => {
+        calls.push(`guard:${u.filename}`)
+        if (u.filename === opts.blockName) throw new ExfilBlockedError(`secret in ${u.filename}`)
+        return new Uint8Array([1])
+      },
+      findUploaded: async () => null,
+      upload: async (ob) => {
+        calls.push(`upload-single:${ob.upload!.filename}`)
+        return 'F-single'
+      },
+      uploadMany: async (obs) => {
+        calls.push(`uploadMany:${obs.map((o) => o.upload!.filename).join(',')}`)
+        if (opts.failFirst && !failed) {
+          failed = true
+          throw rateLimited()
+        }
+        return obs.map((_, i) => `F${i + 1}`)
+      },
+    }
+    return { deps, calls }
+  }
+  async function seeded() {
+    await makeSupervisor().activate(key, 'U')
+    return makeSupervisor()
+  }
+  const outbox = async () => (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+  const noDelay = async () => {}
+
+  test('the file obligations of one reply are recorded with a shared upload group', async () => {
+    const sup = await seeded()
+    const { deps } = makeFileDeps({ failFirst: true })
+    await deliverFileReplyDurably({ supervisor: sup, post: async () => 'ts', files: deps }, reply)
+    const files = (await outbox()).filter((o) => o.upload !== undefined)
+    expect(files.map((o) => o.uploadGroup)).toEqual(['g-1', 'g-1', 'g-1'])
+  })
+
+  test('a transient batch failure is retried by the poller as ONE upload of all files, in order', async () => {
+    const sup = await seeded()
+    const { deps, calls } = makeFileDeps({ failFirst: true })
+    const r = await deliverFileReplyDurably(
+      { supervisor: sup, post: async () => 'ts', files: deps },
+      reply,
+    )
+    expect(r).toMatchObject({ status: 'queued', pending: 3 })
+    calls.length = 0
+    const singles: string[] = []
+    const report = await sup.drainOutbox(
+      async (ob) => {
+        singles.push(ob.id)
+      },
+      { delayMs: noDelay, sendGroup: (obs) => sendFileGroup(deps, obs) },
+    )
+    expect(singles).toEqual([])
+    expect(calls).toEqual([
+      'guard:a.png',
+      'guard:b.png',
+      'guard:c.png',
+      'uploadMany:a.png,b.png,c.png',
+    ])
+    expect(report.delivered).toEqual(['g-1:file:0', 'g-1:file:1', 'g-1:file:2'])
+    const obs = await outbox()
+    expect(obs.filter((o) => o.upload).map((o) => [o.state, o.uploadedFileId])).toEqual([
+      ['delivered', 'F1'],
+      ['delivered', 'F2'],
+      ['delivered', 'F3'],
+    ])
+  })
+
+  test('a transient TEXT failure: the poller posts the text, then the files as one group', async () => {
+    const sup = await seeded()
+    const { deps, calls } = makeFileDeps()
+    await deliverFileReplyDurably(
+      {
+        supervisor: sup,
+        post: async () => {
+          throw rateLimited()
+        },
+        files: deps,
+      },
+      reply,
+    )
+    const order: string[] = []
+    await sup.drainOutbox(
+      async (ob) => {
+        order.push(`text:${ob.id}`)
+      },
+      {
+        delayMs: noDelay,
+        sendGroup: async (obs) => {
+          order.push(`group:${obs.map((o) => o.id).join(',')}`)
+          return sendFileGroup(deps, obs)
+        },
+      },
+    )
+    expect(order).toEqual(['text:g-1:0', 'group:g-1:file:0,g-1:file:1,g-1:file:2'])
+    expect(calls.filter((c) => c.startsWith('upload'))).toEqual(['uploadMany:a.png,b.png,c.png'])
+  })
+
+  test('a file blocked on redelivery dead-letters the whole group; nothing uploads', async () => {
+    const sup = await seeded()
+    const first = makeFileDeps({ failFirst: true })
+    await deliverFileReplyDurably(
+      { supervisor: sup, post: async () => 'ts', files: first.deps },
+      reply,
+    )
+    const later = makeFileDeps({ blockName: 'b.png' })
+    const report = await sup.drainOutbox(async () => {}, {
+      delayMs: noDelay,
+      sendGroup: (obs) => sendFileGroup(later.deps, obs),
+    })
+    expect(later.calls.some((c) => c.startsWith('upload'))).toBe(false)
+    expect(report.deadLettered.map((d) => d.id)).toEqual(['g-1:file:0', 'g-1:file:1', 'g-1:file:2'])
+    expect((await outbox()).filter((o) => o.upload).map((o) => o.state)).toEqual([
+      'dead',
+      'dead',
+      'dead',
+    ])
+  })
+
+  test('sendFileGroup: deduped files are skipped, the rest are guarded then uploaded once', async () => {
+    const calls: string[] = []
+    const deps: FileUploadDeps = {
+      readAndGuard: async (u) => {
+        calls.push(`guard:${u.filename}`)
+        return new Uint8Array([1])
+      },
+      findUploaded: async (ob) => (ob.upload!.filename === 'b.png' ? 'F-old' : null),
+      upload: async () => 'x',
+      uploadMany: async (obs) => {
+        calls.push(`uploadMany:${obs.map((o) => o.upload!.filename).join(',')}`)
+        return obs.map((_, i) => `N${i}`)
+      },
+    }
+    const obs = ['a.png', 'b.png', 'c.png'].map((f, i) => ({
+      id: `g:file:${i}`,
+      channel: 'C',
+      thread: 'T',
+      payload: '',
+      attempts: 0,
+      state: 'pending' as const,
+      createdAt: 0,
+      upload: { path: `/r/${f}`, filename: f },
+      uploadGroup: 'g',
+    }))
+    expect(await sendFileGroup(deps, obs)).toEqual(['N0', 'F-old', 'N1'])
+    expect(calls).toEqual(['guard:a.png', 'guard:c.png', 'uploadMany:a.png,c.png'])
+  })
+
+  test('wiring: the server poller hands file groups to sendFileGroup', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain('sendGroup: (obs) => sendFileGroup(fileSendDeps, obs)')
   })
 })
