@@ -514,7 +514,7 @@ export interface SessionSupervisor {
    *  obligation failure is recorded in the report and the pass continues.
    *  Returns an `OutboxDrainReport`. */
   drainOutbox(
-    send: (obligation: DeliveryObligation) => Promise<void>,
+    send: (obligation: DeliveryObligation) => Promise<string | void>,
     opts?: {
       maxAttempts?: number
       delayMs?: (ms: number) => Promise<void>
@@ -1281,7 +1281,7 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
     },
 
     async drainOutbox(
-      send: (obligation: DeliveryObligation) => Promise<void>,
+      send: (obligation: DeliveryObligation) => Promise<string | void>,
       opts?: {
         maxAttempts?: number
         delayMs?: (ms: number) => Promise<void>
@@ -1336,7 +1336,13 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
           if (unit.length > 1 && opts?.sendGroup !== undefined) {
             fileIds = (await opts.sendGroup(unit)) ?? undefined
           } else {
-            await send(first)
+            // A file send may return its Slack file id (PR #5 delta review): keep
+            // it so even a lone pending group member records uploadedFileId.
+            const sent = await send(first)
+            fileIds =
+              first.upload !== undefined && typeof sent === 'string' && sent !== ''
+                ? [sent]
+                : undefined
           }
         }
         const outcome = await retryDelivery(handle, token, first.attempts, sendUnit, {

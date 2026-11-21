@@ -472,7 +472,12 @@ export interface FileUploadDeps {
    *  recorded `uploadedFileId` still shared there, or a `(filename, size)` scan
    *  match — else `null`. File shares carry no app metadata, so this is a thread
    *  scan, not a metadata key. */
-  findUploaded(obligation: DeliveryObligation): Promise<string | null>
+  findUploaded(
+    obligation: DeliveryObligation,
+    /** Slack file ids already claimed by OTHER files of the same group; never
+     *  returned, so two distinct files can't both dedup to one Slack file. */
+    exclude?: ReadonlySet<string>,
+  ): Promise<string | null>
   /** Upload the ALREADY-READ, ALREADY-GUARDED `bytes` for `obligation.upload` via
    *  `filesUploadV2`; resolve the Slack file id. Never re-reads the path — the
    *  guarded bytes are sent verbatim. Throws on Slack failure (the caller
@@ -727,13 +732,29 @@ export async function sendFileGroup(
   obs: DeliveryObligation[],
 ): Promise<string[]> {
   const ids: string[] = obs.map(() => '')
-  const batch: Array<{ index: number; ob: DeliveryObligation; bytes: Uint8Array }> = []
-  for (const [index, ob] of obs.entries()) {
-    const existing = await files.findUploaded(ob)
+  // Dedup matches Slack files ONE-TO-ONE across the group (PR #5 delta review):
+  // members with an exact recorded id are matched first, then the rest by
+  // (filename, size), each skipping every id already claimed — two distinct
+  // files that share a name and size can never both take one Slack file.
+  const claimed = new Set<string>()
+  const order = [
+    ...obs.flatMap((ob, i) => (ob.uploadedFileId ? [i] : [])),
+    ...obs.flatMap((ob, i) => (ob.uploadedFileId ? [] : [i])),
+  ]
+  const toUpload = new Set<number>()
+  for (const index of order) {
+    const ob = obs[index]!
+    const existing = await files.findUploaded(ob, claimed)
     if (existing) {
       ids[index] = existing
-      continue
+      claimed.add(existing)
+    } else {
+      toUpload.add(index)
     }
+  }
+  const batch: Array<{ index: number; ob: DeliveryObligation; bytes: Uint8Array }> = []
+  for (const [index, ob] of obs.entries()) {
+    if (!toUpload.has(index)) continue
     if (ob.upload === undefined) throw new Error('file obligation has no upload descriptor')
     batch.push({ index, ob, bytes: await files.readAndGuard(ob.upload) })
   }
@@ -815,7 +836,7 @@ export function createFileSendDeps(deps: {
       }
       return bytes
     },
-    async findUploaded(obligation): Promise<string | null> {
+    async findUploaded(obligation, exclude): Promise<string | null> {
       if (obligation.upload === undefined || !obligation.thread) return null
       const { filename, path } = obligation.upload
       const recordedId = obligation.uploadedFileId
@@ -844,6 +865,7 @@ export function createFileSendDeps(deps: {
         const msgMs = m.ts ? Math.round(Number.parseFloat(m.ts) * 1000) : 0
         const fromThisDelivery = msgMs >= obligation.createdAt
         for (const f of m.files ?? []) {
+          if (f.id !== undefined && exclude?.has(f.id)) continue
           if (recordedId && f.id === recordedId) return f.id ?? 'delivered'
           if (fromThisDelivery && size >= 0 && f.name === filename && f.size === size) {
             return f.id ?? 'delivered'
@@ -926,4 +948,3 @@ async function markObligation(
     // Swallow — the poller reconciles obligation state from disk.
   }
 }
-

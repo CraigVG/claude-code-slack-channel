@@ -4225,10 +4225,10 @@ async function main(): Promise<void> {
     readFile: (p) => readFileSync(resolve(p)),
     fileSize: (p) => statSync(resolve(p)).size,
   })
-  const outboxSend = (ob: DeliveryObligation): Promise<void> =>
-    ob.upload !== undefined
-      ? sendFileObligation(fileSendDeps, ob).then(() => undefined)
-      : idempotentSend(ob)
+  // A file send returns its Slack file id; the poller persists it as
+  // uploadedFileId (PR #5 delta review), so redelivery dedups exactly.
+  const outboxSend = (ob: DeliveryObligation): Promise<string | void> =>
+    ob.upload !== undefined ? sendFileObligation(fileSendDeps, ob) : idempotentSend(ob)
   const drainOutboxOnce = (): void => {
     void supervisor!
       // PR #5 review: a queued multi-file reply is redelivered as ONE upload
