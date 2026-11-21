@@ -21166,9 +21166,9 @@ describe('reply images — one message with all the photos in', () => {
     expect(fn).toContain('blocks = plan.blocks')
     expect(fn).toContain('const files = plan.files')
     // A blocks reply is one message on the direct path too (never chunked).
-    expect(fn).toContain(
-      'const chunks = blocks !== undefined ? [text] : chunkText(text, limit, mode)',
-    )
+    expect(fn).toContain('const chunks = replyChunks(text, blocks, limit, mode)')
+    expect(fn).toContain('if (blocks === undefined) return chunkText(text, limit, mode)')
+    expect(fn).toContain("[text.trim() === '' ? blocksFallbackText(blocks) : text]")
   })
 })
 
@@ -21807,7 +21807,7 @@ describe('thread context — parent, previous replies, cache, quoting', () => {
     expect(observe).toBeGreaterThan(dedup)
     expect(observe).toBeLessThan(gateCall)
     const ctxFn = src.slice(src.indexOf('async function inboundContextMeta('))
-    expect(ctxFn).toMatch(/if \(threadTs === undefined \|\| threadTs === ts\) return meta/)
+    expect(ctxFn.slice(0, 1500)).toContain('buildInboundContextMeta(') // reply-only thread lookup: see review item 5 tests
     const click = src.slice(src.indexOf('async function deliverButtonClick('))
     expect(click).toContain('...cardTitleMeta(body.message?.blocks)')
     expect(click).toContain('meta.channel_name = channelName')
@@ -21880,7 +21880,7 @@ describe('reply images — raw path guard runs before any normalization', () => 
     const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
     const start = src.indexOf('async function executeReply(')
     const fn = src.slice(start, src.indexOf('\nasync function executeReact(', start))
-    const preflight = fn.indexOf('preflightReplyFilePaths(argFiles, ctx)')
+    const preflight = fn.indexOf('preflightReplyFiles(argFiles, {')
     const plan = fn.indexOf('planImageReply(')
     const upload = fn.indexOf("resolveCardImages(blocks, 'reply', ctx)")
     expect(preflight).toBeGreaterThan(-1)
@@ -21888,9 +21888,9 @@ describe('reply images — raw path guard runs before any normalization', () => 
     expect(upload).toBeGreaterThan(plan)
     expect(fn).toContain('toAbsoluteUnnormalized(f, process.cwd())')
     expect(fn).not.toMatch(/planImageReply\([^)]*resolve\(f\)/)
-    const pre = src.slice(src.indexOf('function preflightReplyFilePaths('))
-    expect(pre.slice(0, 600)).toContain('ctx.assertSendable(filePath)')
-    expect(pre.slice(0, 600)).toContain("kind: 'exfil.block'")
+    const pre = fn.slice(preflight, preflight + 600)
+    expect(pre).toContain('assertSendable: ctx.assertSendable')
+    expect(pre).toContain("kind: 'exfil.block'")
   })
 })
 
@@ -22131,5 +22131,311 @@ describe('pinned-https — real TLS against a local server', () => {
         signal: ac.signal,
       }),
     ).rejects.toThrow(/aborted/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR #8 review round 3 (rv-slack-plugin-8-opus-d) — items 3, 4, 5
+// ---------------------------------------------------------------------------
+
+describe('review item 3 — a blocks reply with empty text keeps its message on the durable path', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  const key = { channel: 'C_MIX', thread: 'T1' }
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-mix-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => rmSync(rawRoot, { recursive: true, force: true }))
+  const makeSupervisor = () =>
+    createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => 1_700_000_000_000,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+
+  test('empty text + image card + one other file: the card is posted, then the file', async () => {
+    await makeSupervisor().activate(key, 'U')
+    const sup = makeSupervisor()
+    const posted: Array<{ text: string; blocks?: unknown }> = []
+    const poster: ReplyPoster = async (ob) => {
+      posted.push({ text: ob.payload, blocks: ob.blocks })
+      return 'ts-card'
+    }
+    const order: string[] = []
+    const deps: FileUploadDeps = {
+      readAndGuard: async () => new Uint8Array([1]),
+      findUploaded: async () => null,
+      upload: async () => {
+        order.push('file')
+        return 'F-pdf'
+      },
+    }
+    const card = [{ type: 'image', slack_file: { id: 'F-img' }, alt_text: 'a.png' }]
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: async (ob, k) => (order.push('card'), poster(ob, k)), files: deps },
+      {
+        id: 'r-mix',
+        channel: 'C_MIX',
+        thread: 'T1',
+        chunks: [], // the empty text chunk the reply path filtered out
+        files: [{ path: '/r/notes.pdf', filename: 'notes.pdf' }],
+        blocks: card,
+      },
+    )
+    expect(posted).toEqual([{ text: '[image: a.png]', blocks: card }])
+    expect(order).toEqual(['card', 'file'])
+    expect(result).toMatchObject({ status: 'delivered', messagesSent: 1, filesSent: 1 })
+  })
+
+  test('without blocks an empty reply still sends only the files (unchanged)', async () => {
+    await makeSupervisor().activate(key, 'U')
+    const sup = makeSupervisor()
+    let posts = 0
+    const result = await deliverFileReplyDurably(
+      {
+        supervisor: sup,
+        post: async () => {
+          posts++
+          return 'ts'
+        },
+        files: {
+          readAndGuard: async () => new Uint8Array([1]),
+          findUploaded: async () => null,
+          upload: async () => 'F1',
+        },
+      },
+      {
+        id: 'r-f',
+        channel: 'C_MIX',
+        thread: 'T1',
+        chunks: [],
+        files: [{ path: '/r/a.pdf', filename: 'a.pdf' }],
+      },
+    )
+    expect(posts).toBe(0)
+    expect(result).toMatchObject({ status: 'delivered', messagesSent: 0, filesSent: 1 })
+  })
+
+  test('blocksFallbackText names the images, else a neutral word', async () => {
+    const { blocksFallbackText } = await import('./slack-delivery.ts')
+    expect(
+      blocksFallbackText([
+        { type: 'section', text: { type: 'mrkdwn', text: 'x' } },
+        { type: 'image', alt_text: 'a.png' },
+        { type: 'image', alt_text: 'b.gif' },
+      ]),
+    ).toBe('[image: a.png, b.gif]')
+    expect(blocksFallbackText([{ type: 'actions', elements: [] }])).toBe('(message)')
+  })
+
+  test('wiring: the reply file path keeps the text chunk whenever blocks are set', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const fn = src.slice(src.indexOf('async function executeReplyFileDurablePath('))
+    expect(fn.slice(0, 2500)).toContain(
+      'blocks !== undefined ? chunks : chunks.filter((c) => c.length > 0)',
+    )
+  })
+})
+
+describe('review item 4 — every file is fully checked before the FIRST upload', () => {
+  type Ev = string
+  function deps(events: Ev[], opts: { secretIn?: string; badPath?: string } = {}) {
+    return {
+      assertSendable: (p: string) => {
+        events.push(`path:${p}`)
+        if (p === opts.badPath) throw new Error('Blocked: path')
+      },
+      assertNoSecretValues: (payload: string) => {
+        if (opts.secretIn !== undefined && payload.includes(opts.secretIn)) {
+          throw new Error('Blocked: secret value')
+        }
+      },
+      readFile: (p: string) => {
+        events.push(`read:${p}`)
+        return new TextEncoder().encode(p.endsWith('notes.txt') ? 'TOKEN-XYZ inside' : 'ok')
+      },
+      onBlock: (reason: string) => events.push(`journal:${reason}`),
+    }
+  }
+
+  test('a secret VALUE inside a non-image file refuses the whole reply before anything uploads', async () => {
+    const { preflightReplyFiles } = await import('./private-image-blocks.ts')
+    const events: Ev[] = []
+    expect(() =>
+      preflightReplyFiles(['/r/a.png', '/r/notes.txt'], deps(events, { secretIn: 'TOKEN-XYZ' })),
+    ).toThrow('Blocked: secret value')
+    expect(events).toEqual([
+      'path:/r/a.png',
+      'read:/r/a.png',
+      'path:/r/notes.txt',
+      'read:/r/notes.txt',
+      'journal:Blocked: secret value',
+    ])
+  })
+
+  test('a secret in a FILE NAME is refused too; the path guard runs before the read', async () => {
+    const { preflightReplyFiles } = await import('./private-image-blocks.ts')
+    const events: Ev[] = []
+    expect(() =>
+      preflightReplyFiles(['/r/TOKEN-XYZ.pdf'], deps(events, { secretIn: 'TOKEN-XYZ' })),
+    ).toThrow('Blocked: secret value')
+    const ev2: Ev[] = []
+    expect(() =>
+      preflightReplyFiles(['/r/../x.pdf'], deps(ev2, { badPath: '/r/../x.pdf' })),
+    ).toThrow('Blocked: path')
+    expect(ev2).toEqual(['path:/r/../x.pdf', 'journal:Blocked: path'])
+  })
+
+  test('clean files pass and every one is checked', async () => {
+    const { preflightReplyFiles } = await import('./private-image-blocks.ts')
+    const events: Ev[] = []
+    preflightReplyFiles(['/r/a.png', '/r/b.pdf'], deps(events))
+    expect(events).toEqual(['path:/r/a.png', 'read:/r/a.png', 'path:/r/b.pdf', 'read:/r/b.pdf'])
+    preflightReplyFiles(undefined, deps(events))
+  })
+
+  test('wiring: executeReply runs the full preflight before planning and before any upload', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = src.indexOf('async function executeReply(')
+    const fn = src.slice(start, src.indexOf('\nasync function executeReact(', start))
+    const pre = fn.indexOf('preflightReplyFiles(argFiles, {')
+    expect(pre).toBeGreaterThan(-1)
+    expect(fn.indexOf('planImageReply(')).toBeGreaterThan(pre)
+    expect(fn.indexOf("resolveCardImages(blocks, 'reply', ctx)")).toBeGreaterThan(pre)
+    expect(fn.indexOf('executeReplyFileUploads(')).toBeGreaterThan(pre)
+  })
+})
+
+describe('review item 5 — metadata lookups have a deadline and are shared in flight', () => {
+  const never = <T>() => new Promise<T>(() => {})
+
+  test('withDeadline returns the fallback when the lookup hangs, the value when it is quick', async () => {
+    const { withDeadline } = await import('./thread-context.ts')
+    const t0 = Date.now()
+    expect(await withDeadline(never<string>(), 30, 'fallback')).toBe('fallback')
+    expect(Date.now() - t0).toBeLessThan(1000)
+    expect(await withDeadline(Promise.resolve('v'), 1000, 'fallback')).toBe('v')
+    expect(await withDeadline(Promise.reject(new Error('x')), 1000, 'fallback')).toBe('fallback')
+  })
+
+  test('hung channel + thread lookups: delivery meta comes back empty within the deadline', async () => {
+    const { buildInboundContextMeta, ThreadContextCache } = await import('./thread-context.ts')
+    const t0 = Date.now()
+    const meta = await buildInboundContextMeta(
+      { channel: 'C1', ts: '2.0', threadTs: '1.0' },
+      {
+        channelName: () => never(),
+        cache: new ThreadContextCache(),
+        thread: {
+          fetchReplies: () => never(),
+          resolveName: async (id) => id,
+          messageText: () => '',
+        },
+        deadlineMs: 40,
+      },
+    )
+    expect(meta).toEqual({})
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
+
+  test('a quick channel name still arrives when only the thread lookup hangs', async () => {
+    const { buildInboundContextMeta, ThreadContextCache } = await import('./thread-context.ts')
+    const meta = await buildInboundContextMeta(
+      { channel: 'C1', ts: '2.0', threadTs: '1.0' },
+      {
+        channelName: async () => 'hive',
+        cache: new ThreadContextCache(),
+        thread: {
+          fetchReplies: () => never(),
+          resolveName: async (id) => id,
+          messageText: () => '',
+        },
+        deadlineMs: 40,
+      },
+    )
+    expect(meta).toEqual({ channel_name: 'hive' })
+  })
+
+  test('top-level messages never touch the thread lookup', async () => {
+    const { buildInboundContextMeta, ThreadContextCache } = await import('./thread-context.ts')
+    let fetched = 0
+    const meta = await buildInboundContextMeta(
+      { channel: 'C1', ts: '1.0', threadTs: undefined },
+      {
+        channelName: async () => 'hive',
+        cache: new ThreadContextCache(),
+        thread: {
+          fetchReplies: async () => {
+            fetched++
+            return { messages: [], hasMore: false }
+          },
+          resolveName: async (id) => id,
+          messageText: () => '',
+        },
+        deadlineMs: 1000,
+      },
+    )
+    expect(meta).toEqual({ channel_name: 'hive' })
+    expect(fetched).toBe(0)
+  })
+
+  test('two simultaneous cold loads of one thread make ONE conversations.replies call', async () => {
+    const { ThreadContextCache } = await import('./thread-context.ts')
+    const cache = new ThreadContextCache()
+    let calls = 0
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    const deps = {
+      fetchReplies: async () => {
+        calls++
+        await gate
+        return { messages: [{ ts: '1.0', user: 'U1', text: 'parent' }], hasMore: false }
+      },
+      resolveName: async (id: string) => id,
+      messageText: (m: Record<string, unknown>) => String(m.text ?? ''),
+    }
+    const a = cache.load('C1', '1.0', deps)
+    const b = cache.load('C1', '1.0', deps)
+    release()
+    const [ea, eb] = await Promise.all([a, b])
+    expect(calls).toBe(1)
+    expect(ea).toBe(eb)
+    // A failed load is not cached and does not wedge the key.
+    const failing = { ...deps, fetchReplies: async () => Promise.reject(new Error('rate_limited')) }
+    await expect(cache.load('C2', '1.0', failing)).rejects.toThrow('rate_limited')
+    await cache.load('C2', '1.0', deps)
+  })
+
+  test('SingleFlight shares one in-flight lookup per key and forgets it when done', async () => {
+    const { SingleFlight } = await import('./thread-context.ts')
+    const sf = new SingleFlight<string, string>()
+    let calls = 0
+    const fn = async () => {
+      calls++
+      await new Promise((r) => setTimeout(r, 5))
+      return 'v'
+    }
+    const [x, y] = await Promise.all([sf.run('k', fn), sf.run('k', fn)])
+    expect([x, y, calls]).toEqual(['v', 'v', 1])
+    await sf.run('k', fn)
+    expect(calls).toBe(2)
+  })
+
+  test('wiring: message and click delivery go through the deadline', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const ctxFn = src.slice(src.indexOf('async function inboundContextMeta('))
+    expect(ctxFn.slice(0, 1500)).toContain('buildInboundContextMeta(')
+    expect(ctxFn.slice(0, 1500)).toContain('deadlineMs: METADATA_DEADLINE_MS')
+    const click = src.slice(src.indexOf('async function deliverButtonClick('))
+    expect(click).toMatch(
+      /withDeadline\(\s*resolveChannelName\(web, channelId\),\s*METADATA_DEADLINE_MS/,
+    )
+    const rcn = src.slice(src.indexOf('async function resolveChannelName('))
+    expect(rcn.slice(0, 1200)).toContain('channelNameFlights.run(')
   })
 })

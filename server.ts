@@ -130,11 +130,13 @@ import {
 import {
   createPrivateImageDeps,
   planImageReply,
+  preflightReplyFiles,
   resolvePrivateImageBlocks,
   toAbsoluteUnnormalized,
 } from './private-image-blocks.ts'
 import {
   beginDurableStream,
+  blocksFallbackText,
   createDeliverySendDeps,
   createFileSendDeps,
   createReplyPoster,
@@ -148,12 +150,14 @@ import {
 import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 import {
   BoundedTtlCache,
+  buildInboundContextMeta,
   cardTitleMeta,
-  getThreadContext,
+  METADATA_DEADLINE_MS,
   quoteSnippet,
+  SingleFlight,
   ThreadContextCache,
   type ThreadContextDeps,
-  threadContextMeta,
+  withDeadline,
 } from './thread-context.ts'
 
 // ---------------------------------------------------------------------------
@@ -877,18 +881,23 @@ const channelNameCache = new BoundedTtlCache<string, string>(500, 60 * 60_000)
 
 /** `#name` for a channel (cached, bounded). DMs and lookup failures give
  *  undefined — the meta then simply has no channel_name. */
+const channelNameFlights = new SingleFlight<string, string | undefined>()
+
 async function resolveChannelName(client: WebClient, channel: string): Promise<string | undefined> {
   const hit = channelNameCache.get(channel)
   if (hit !== undefined) return hit || undefined
-  try {
-    const res = await client.conversations.info({ channel })
-    const raw = (res.channel as { name?: unknown } | undefined)?.name
-    const name = typeof raw === 'string' ? quoteSnippet(raw, 80) : ''
-    channelNameCache.set(channel, name)
-    return name || undefined
-  } catch {
-    return undefined
-  }
+  // Concurrent lookups for one channel share a single conversations.info.
+  return channelNameFlights.run(channel, async () => {
+    try {
+      const res = await client.conversations.info({ channel })
+      const raw = (res.channel as { name?: unknown } | undefined)?.name
+      const name = typeof raw === 'string' ? quoteSnippet(raw, 80) : ''
+      channelNameCache.set(channel, name)
+      return name || undefined
+    } catch {
+      return undefined
+    }
+  })
 }
 
 const threadContextCache = new ThreadContextCache({ max: 200, ttlMs: 10 * 60_000 })
@@ -937,34 +946,24 @@ function observeThreadMessage(ev: Record<string, unknown>): void {
   })
 }
 
-/** Quoted context meta for an inbound message: channel_name always (when
- *  known); thread parent + previous 2 replies for a thread reply. Never
- *  throws — a Slack failure just leaves the context out. */
+/** Quoted context meta for an inbound message, bounded by
+ *  METADATA_DEADLINE_MS: past it the message is delivered without the missing
+ *  parts (PR #8 review item 5). Never throws. */
 async function inboundContextMeta(
   client: WebClient,
   channel: string,
   ts: string,
   threadTs: string | undefined,
 ): Promise<Record<string, string>> {
-  const meta: Record<string, string> = {}
-  const name = await resolveChannelName(client, channel)
-  if (name) meta.channel_name = name
-  if (threadTs === undefined || threadTs === ts) return meta
-  try {
-    const ctx = await getThreadContext(
-      channel,
-      threadTs,
-      ts,
-      threadContextCache,
-      threadContextDeps(client),
-    )
-    Object.assign(meta, threadContextMeta(ctx))
-  } catch (err) {
-    console.error('[slack] thread context unavailable', {
-      error: err instanceof Error ? err.message : String(err),
-    })
-  }
-  return meta
+  return buildInboundContextMeta(
+    { channel, ts, threadTs },
+    {
+      channelName: (c) => resolveChannelName(client, c),
+      cache: threadContextCache,
+      thread: threadContextDeps(client),
+      deadlineMs: METADATA_DEADLINE_MS,
+    },
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,8 +1684,10 @@ async function executeReplyFileDurablePath(opts: {
   })
 
   // Drop empty chunks so a files-only reply (empty text) uploads files without an
-  // empty Slack message; each path resolves to a basename for the upload filename.
-  const textChunks = chunks.filter((c) => c.length > 0)
+  // empty Slack message — but NEVER when blocks are set: the blocks ride on the
+  // first text obligation, so dropping it would lose the card (PR #8 review
+  // item 3). Each path resolves to a basename for the upload filename.
+  const textChunks = blocks !== undefined ? chunks : chunks.filter((c) => c.length > 0)
   const fileDescriptors = files.map((p) => ({ path: p, filename: basename(resolve(p)) }))
 
   const result = await deliverFileReplyDurably(
@@ -1719,25 +1720,6 @@ async function executeReplyFileDurablePath(opts: {
         text: `Sent ${result.delivered} of ${total} item(s) to ${chatId}; ${result.pending} queued for delivery (transient Slack error; the poller retries the rest in order)`,
       },
     ],
-  }
-}
-
-/** Run the outbound file guard on every reply file path EXACTLY as the caller
- *  gave it, journaling a block. `assertSendable` rejects a raw `..` component
- *  before it resolves anything, so this must see the unnormalized input. */
-function preflightReplyFilePaths(files: readonly string[] | undefined, ctx: ToolContext): void {
-  for (const filePath of files ?? []) {
-    try {
-      ctx.assertSendable(filePath)
-    } catch (exfilErr) {
-      ctx.journalWrite({
-        kind: 'exfil.block',
-        outcome: 'deny',
-        toolName: 'reply',
-        reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
-      })
-      throw exfilErr
-    }
   }
 }
 
@@ -1774,11 +1756,18 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // paths, so the block guards below and resolveCardImages give them the same
   // file checks and ONE private upload before the single post. Other files
   // keep the ordinary share.
-  // PR #8 review P1: every reply file path is checked AS GIVEN (raw `..`
-  // components rejected, realpath allowlist + denylist) BEFORE any path is made
-  // absolute or any upload starts — for image and non-image files alike. The
-  // per-upload guards still run on the bytes later.
-  preflightReplyFilePaths(argFiles, ctx)
+  // PR #8 review items 1 + 4: every reply file is checked completely BEFORE any
+  // path is made absolute or any upload starts — image and non-image alike:
+  // path AS GIVEN (raw `..` rejected, realpath allowlist + denylist), then the
+  // secret-value scan of its bytes and name. The per-upload guards still run
+  // again at each upload (and on durable retries).
+  preflightReplyFiles(argFiles, {
+    assertSendable: ctx.assertSendable,
+    assertNoSecretValues: ctx.assertNoSecretValues,
+    readFile: (p) => readFileSync(p),
+    onBlock: (reason) =>
+      ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName: 'reply', reason }),
+  })
   const plan = planImageReply(text, argFiles, blocks, (f) =>
     toAbsoluteUnnormalized(f, process.cwd()),
   )
@@ -1848,7 +1837,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // (a blocked file surfaces, exactly as the best-effort path did).
   // A blocks reply is a single message: text is the notification fallback and
   // is never chunked (Slack renders the blocks, not the text).
-  const chunks = blocks !== undefined ? [text] : chunkText(text, limit, mode)
+  const chunks = replyChunks(text, blocks, limit, mode)
   const hasFiles = files !== undefined && files.length > 0
 
   if (!stream && threadTs !== undefined && supervisor !== null) {
@@ -1894,6 +1883,20 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
       },
     ],
   }
+}
+
+/** The text messages of a reply. A blocks reply is ONE message whose text is
+ *  the notification fallback (never chunked); empty text gets a fallback from
+ *  the blocks so the message is never empty. Kept out of executeReply for the
+ *  CRAP gate. */
+function replyChunks(
+  text: string,
+  blocks: Array<Record<string, unknown>> | undefined,
+  limit: number,
+  mode: 'length' | 'newline',
+): string[] {
+  if (blocks === undefined) return chunkText(text, limit, mode)
+  return [text.trim() === '' ? blocksFallbackText(blocks) : text]
 }
 
 // -----------------------------------------------------------------------
@@ -3472,7 +3475,11 @@ async function deliverButtonClick(
     ...cardTitleMeta(body.message?.blocks),
   }
   if (threadTs !== undefined) meta.thread_ts = threadTs
-  const channelName = await resolveChannelName(web, channelId)
+  const channelName = await withDeadline(
+    resolveChannelName(web, channelId),
+    METADATA_DEADLINE_MS,
+    undefined,
+  )
   if (channelName) meta.channel_name = channelName
 
   // Delivered clicks are journaled like delivered messages: a click is a

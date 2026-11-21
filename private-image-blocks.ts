@@ -196,6 +196,38 @@ export function composeImageReplyBlocks(
   return out
 }
 
+/** Check EVERY reply file completely before the FIRST upload of any kind
+ *  (PR #8 review items 1 + 4): for each path, exactly as given, the outbound
+ *  path guard (raw `..` refused, realpath allowlist + denylist), then the
+ *  secret-value scan of its bytes and of its file name. A block is reported to
+ *  `onBlock` (journal) and thrown, so a reply never ends half-sent (image card
+ *  posted, then a later file refused). The per-upload guards still run again
+ *  at each upload and on every durable retry. */
+export function preflightReplyFiles(
+  files: readonly string[] | undefined,
+  deps: {
+    assertSendable: (path: string) => void
+    assertNoSecretValues: (payload: string) => void
+    readFile: (path: string) => Uint8Array
+    onBlock: (reason: string) => void
+  },
+): void {
+  const guarded = (fn: () => void): void => {
+    try {
+      fn()
+    } catch (err) {
+      deps.onBlock(err instanceof Error ? err.message : String(err))
+      throw err
+    }
+  }
+  for (const path of files ?? []) {
+    guarded(() => deps.assertSendable(path))
+    const bytes = deps.readFile(path)
+    guarded(() => deps.assertNoSecretValues(Buffer.from(bytes).toString('latin1')))
+    guarded(() => deps.assertNoSecretValues(basenameOf(path)))
+  }
+}
+
 /** Absolute form of a reply path WITHOUT normalizing it: an absolute path is
  *  kept byte for byte and a relative one is only prefixed with `cwd`, so any
  *  `..` survives into the image block and the per-upload `assertSendable`

@@ -138,8 +138,44 @@ function toThreadMsg(m: Record<string, unknown>, deps: ThreadContextDeps): Threa
   }
 }
 
+/** Resolve to `promise`'s value, or to `fallback` once `ms` pass or if it
+ *  rejects. The original promise keeps running (it may still warm a cache);
+ *  its rejection is always handled. Delivery never waits longer than `ms`
+ *  for optional metadata (PR #8 review item 5: the Slack client retries for
+ *  minutes under rate limiting). */
+export function withDeadline<T, F>(promise: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  return new Promise<T | F>((resolveValue) => {
+    const timer = setTimeout(() => resolveValue(fallback), ms)
+    promise.then(
+      (v) => {
+        clearTimeout(timer)
+        resolveValue(v)
+      },
+      () => {
+        clearTimeout(timer)
+        resolveValue(fallback)
+      },
+    )
+  })
+}
+
+/** One in-flight lookup per key: concurrent callers share it; the key is
+ *  forgotten once it settles (success or failure), so a failure never sticks. */
+export class SingleFlight<K, V> {
+  private readonly inflight = new Map<K, Promise<V>>()
+
+  run(key: K, fn: () => Promise<V>): Promise<V> {
+    const existing = this.inflight.get(key)
+    if (existing) return existing
+    const p = fn().finally(() => this.inflight.delete(key))
+    this.inflight.set(key, p)
+    return p
+  }
+}
+
 export class ThreadContextCache {
   private readonly cache: BoundedTtlCache<string, ThreadEntry>
+  private readonly loads = new SingleFlight<string, ThreadEntry>()
 
   constructor(opts: { max?: number; ttlMs?: number; now?: () => number } = {}) {
     this.cache = new BoundedTtlCache(opts.max ?? 200, opts.ttlMs ?? 10 * 60_000, opts.now)
@@ -166,6 +202,16 @@ export class ThreadContextCache {
     const key = ThreadContextCache.key(channel, threadTs)
     const hit = this.cache.get(key)
     if (hit) return hit
+    // Concurrent cold deliveries in one thread share ONE conversations.replies.
+    return this.loads.run(key, () => this.fetchEntry(key, channel, threadTs, deps))
+  }
+
+  private async fetchEntry(
+    key: string,
+    channel: string,
+    threadTs: string,
+    deps: ThreadContextDeps,
+  ): Promise<ThreadEntry> {
     const { messages, hasMore } = await deps.fetchReplies(channel, threadTs)
     const msgs = messages
       .map((m) => toThreadMsg(m, deps))
@@ -223,6 +269,41 @@ export function threadContextMeta(ctx: ThreadContext): Record<string, string> {
     meta[`thread_prev_${i + 1}_text`] = QUOTED_PREFIX + p.text
   }
   if (Object.keys(meta).length > 0) meta.context_quoted = 'true'
+  return meta
+}
+
+/** Default deadline for optional delivery metadata (channel name, thread
+ *  context). Past it the message is delivered without them. */
+export const METADATA_DEADLINE_MS = 1500
+
+/** Quoted context meta for one inbound message, never slower than
+ *  `deadlineMs`: `channel_name` (when known), plus thread parent + previous 2
+ *  replies for a thread reply. Each lookup that misses the deadline or fails
+ *  is simply left out; the lookups run in parallel and keep warming their
+ *  caches in the background. Never throws. */
+export async function buildInboundContextMeta(
+  msg: { channel: string; ts: string; threadTs: string | undefined },
+  deps: {
+    channelName: (channel: string) => Promise<string | undefined>
+    cache: ThreadContextCache
+    thread: ThreadContextDeps
+    deadlineMs: number
+  },
+): Promise<Record<string, string>> {
+  const isReply = msg.threadTs !== undefined && msg.threadTs !== msg.ts
+  const [name, ctx] = await Promise.all([
+    withDeadline(deps.channelName(msg.channel), deps.deadlineMs, undefined),
+    isReply
+      ? withDeadline(
+          getThreadContext(msg.channel, msg.threadTs!, msg.ts, deps.cache, deps.thread),
+          deps.deadlineMs,
+          undefined,
+        )
+      : Promise.resolve(undefined),
+  ])
+  const meta: Record<string, string> = {}
+  if (name) meta.channel_name = name
+  if (ctx) Object.assign(meta, threadContextMeta(ctx))
   return meta
 }
 

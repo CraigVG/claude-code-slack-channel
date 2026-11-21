@@ -71,6 +71,7 @@ Before step 1, confirm you have:
    - `files:read` — download shared files
    - `files:write` — upload files
    - `users:read` — resolve display names
+   - *Optional:* `channels:read` and `groups:read` — let inbound messages carry the channel name (`channel_name`, read with `conversations.info`). Without them the plugin works the same and simply leaves `channel_name` out.
 5. **Install to Workspace** → Copy Bot Token (`xoxb-...`)
 
 ### 2. Configure Tokens
