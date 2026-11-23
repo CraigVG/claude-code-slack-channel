@@ -5,6 +5,8 @@
     "includes": [
       "lib.ts",
       "server.ts",
+      "last-bot-context.ts",
+      "thread-context.ts",
       "policy.ts",
       "journal.ts",
       "manifest.ts",
