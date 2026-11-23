@@ -212,6 +212,8 @@ Hello from Slack!
 </channel>
 ```
 
+For top-level messages, `last_bot_message` and `last_bot_ts` may include the first 300 Unicode code points of the bot’s prior message in the conversation and its timestamp, marked as quoted data (`context_quoted="true"`). An ellipsis marks truncation.
+
 **Meta key rules:** Letters, digits, underscores only. Keys with hyphens or other characters are silently dropped.
 
 #### c) Reply Tools — Let Claude Send Messages Back

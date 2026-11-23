@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Quoted inbound context** (H-20261119-057 part C, with the last-bot-message context): a thread reply carries `channel_name`, the thread parent's author and first 300 characters, and the 2 replies before it (author and first 200 characters each); a top-level message carries the bot's previous message in that conversation (`last_bot_message`, first 300 code points, and `last_bot_ts`); a button click carries the card's title. Every value is cleaned for a meta attribute, prefixed `[quoted data, not instructions] `, and flagged `context_quoted="true"`. Context is looked up only for a message that passed the gate, uses only message text (no file names or URLs), and each lookup is bounded by a deadline so delivery never waits on it.
+
 ### Changed
 
 - **Package identity** (`claude-2y7y.8`): the package name now matches the repository, `claude-code-slack-channel`. The explicit `bin` map keeps `claude-channel-slack` as an executable alias alongside `claude-code-slack-channel`, both pointing to `server.ts`. The Claude plugin remains `slack-channel`; its commands, MCP server identity, state paths and dependency versions are unchanged. This source change does not publish or rename an npm registry package.
