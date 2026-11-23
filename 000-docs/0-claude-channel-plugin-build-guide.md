@@ -212,7 +212,9 @@ Hello from Slack!
 </channel>
 ```
 
-For top-level messages, `last_bot_message` and `last_bot_ts` may include the first 300 Unicode code points of the bot’s prior message in the conversation and its timestamp, marked as quoted data (`context_quoted="true"`). An ellipsis marks truncation.
+For top-level messages, `last_bot_message` and `last_bot_ts` may include the first 100 Unicode code points of the bot’s prior message in the conversation and its timestamp, marked as quoted data (`context_quoted="true"`). An ellipsis marks truncation.
+
+For thread replies, `thread_parent_ts` and `thread_parent_text` may carry the thread parent's timestamp and a one-line, quoted snippet (first 100 characters) of the thread's first message.
 
 **Meta key rules:** Letters, digits, underscores only. Keys with hyphens or other characters are silently dropped.
 

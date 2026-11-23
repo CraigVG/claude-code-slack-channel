@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Quoted inbound context** (H-20261119-057 part C, with the last-bot-message context): a thread reply carries `channel_name`, the thread parent's author and first 300 characters, and the 2 replies before it (author and first 200 characters each); a top-level message carries the bot's previous message in that conversation (`last_bot_message`, first 300 code points, and `last_bot_ts`); a button click carries the card's title. Every value is cleaned for a meta attribute, prefixed `[quoted data, not instructions] `, and flagged `context_quoted="true"`. Context is looked up only for a message that passed the gate, uses only message text (no file names or URLs), and each lookup is bounded by a deadline so delivery never waits on it.
+- **Quoted inbound context** (H-20261119-057 part C, Craig's option A): an inbound thread reply carries `thread_parent_ts` and `thread_parent_text`, a one-line snippet (first 100 characters) of the thread's first message; a top-level message carries the bot's previous message in that conversation (`last_bot_message`, first 100 code points, and `last_bot_ts`). Every quoted value is cleaned for a meta attribute, prefixed `[quoted data, not instructions] `, and flagged `context_quoted="true"`. Context is looked up only for a message that passed the gate, uses only message text (no file names or URLs), runs on its own Slack client (a 429 fails at once and never pauses replies), and is bounded by a deadline so delivery never waits on it.
 
 ### Changed
 

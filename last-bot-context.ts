@@ -3,7 +3,7 @@ import type { GateResult } from './lib.ts'
 import { QUOTED_PREFIX, quoteSnippet } from './thread-context.ts'
 
 const MAX_CONVERSATIONS = 256
-const MAX_CONTEXT_CHARS = 300
+const MAX_CONTEXT_CHARS = 100
 const HISTORY_LIMIT = 5
 
 type BotMessage = { ts: string; text: string }
