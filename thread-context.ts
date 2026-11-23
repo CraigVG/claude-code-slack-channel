@@ -331,6 +331,18 @@ export function resolveActorName(
   return withDeadline(resolveName(userId), deadlineMs, checkedUserIdFallback(userId))
 }
 
+/** Options for the Slack client that serves context lookups (thread
+ *  replies, channel names, quoted authors). It is its OWN WebClient instance:
+ *  a 429 there never pauses the main client's queue, so replies keep flowing.
+ *  A rate-limited call fails at once instead of waiting out Retry-After
+ *  (which can be 30 minutes); other failures get a few quick retries. The
+ *  caller delivers without context on any failure. */
+export const CONTEXT_LOOKUP_CLIENT_OPTIONS = {
+  timeout: 5_000,
+  retryConfig: { retries: 2, factor: 2, minTimeout: 200, maxTimeout: 1_000 },
+  rejectRateLimitedCalls: true,
+}
+
 /** Default deadline for optional delivery metadata (channel name, thread
  *  context). Past it the message is delivered without them. */
 export const METADATA_DEADLINE_MS = 1500

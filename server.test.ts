@@ -21473,8 +21473,8 @@ describe('thread context — parent, previous replies, cache, quoting', () => {
       src.indexOf('async function deliverEvent('),
       src.indexOf('\nasync function handleMessage('),
     )
-    expect(de).toContain(
-      'await inboundContextMeta(web, channelId, ev.ts as string, incomingThreadTs)',
+    expect(de).toMatch(
+      /await inboundContextMeta\(\s*threadContextWeb,\s*channelId,\s*ev\.ts as string,\s*incomingThreadTs,?\s*\)/,
     )
     expect(de).toContain('Object.assign(meta, await getLastBotContext())')
     const hm = src.slice(src.indexOf('async function handleMessage('))
@@ -21651,7 +21651,7 @@ describe('thread context — metadata lookups have a deadline and are shared in 
     expect(ctxFn.slice(0, 1500)).toContain('deadlineMs: METADATA_DEADLINE_MS')
     const click = src.slice(src.indexOf('async function deliverButtonClick('))
     expect(click).toMatch(
-      /withDeadline\(\s*resolveChannelName\(web, channelId\),\s*METADATA_DEADLINE_MS/,
+      /withDeadline\(\s*resolveChannelName\(threadContextWeb, channelId\),\s*METADATA_DEADLINE_MS/,
     )
     const rcn = src.slice(src.indexOf('async function resolveChannelName('))
     expect(rcn.slice(0, 1200)).toContain('channelNameFlights.run(')
@@ -21738,5 +21738,97 @@ describe('thread context — sender names: deadline and format-checked fallback'
       'await resolveActorName(userId, resolveUserName, METADATA_DEADLINE_MS)',
     )
     expect(src).toContain('const resolveUserName = createUserNameResolver({')
+  })
+})
+
+describe('thread context — its own Slack client; a 429 never blocks delivery or replies', () => {
+  test('context options: a separate client that fails fast on a rate limit, few retries', async () => {
+    const { CONTEXT_LOOKUP_CLIENT_OPTIONS } = await import('./thread-context.ts')
+    expect(CONTEXT_LOOKUP_CLIENT_OPTIONS.rejectRateLimitedCalls).toBe(true)
+    expect(CONTEXT_LOOKUP_CLIENT_OPTIONS.retryConfig.retries).toBeGreaterThan(0)
+    expect(CONTEXT_LOOKUP_CLIENT_OPTIONS.retryConfig.retries).toBeLessThanOrEqual(3)
+  })
+
+  test('a 429 (Retry-After 30 min) on context lookups delivers without context, fast, and the main client still posts', async () => {
+    const { WebClient } = await import('@slack/web-api')
+    const { CONTEXT_LOOKUP_CLIENT_OPTIONS, buildInboundContextMeta, ThreadContextCache } =
+      await import('./thread-context.ts')
+    const hits: string[] = []
+    const server = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch(req) {
+        const method = new URL(req.url).pathname.split('/').pop() ?? ''
+        hits.push(method)
+        if (method === 'chat.postMessage') {
+          return Response.json({ ok: true, channel: 'C1', ts: '9.000001' })
+        }
+        return new Response(JSON.stringify({ ok: false, error: 'ratelimited' }), {
+          status: 429,
+          headers: { 'Retry-After': '1800', 'content-type': 'application/json' },
+        })
+      },
+    })
+    try {
+      const slackApiUrl = `http://127.0.0.1:${server.port}/api/`
+      const contextClient = new WebClient('xoxb-test', {
+        ...CONTEXT_LOOKUP_CLIENT_OPTIONS,
+        slackApiUrl,
+      })
+      const mainClient = new WebClient('xoxb-test', { slackApiUrl })
+      const t0 = Date.now()
+      const meta = await buildInboundContextMeta(
+        { channel: 'C1', ts: '2.000002', threadTs: '2.000001' },
+        {
+          channelName: async (channel) => {
+            const res = await contextClient.conversations.info({ channel })
+            return String((res.channel as { name?: unknown } | undefined)?.name ?? '')
+          },
+          cache: new ThreadContextCache(),
+          thread: {
+            fetchReplies: async (channel, ts) => {
+              const res = await contextClient.conversations.replies({ channel, ts })
+              return {
+                messages: (res.messages ?? []) as Array<Record<string, unknown>>,
+                hasMore: false,
+              }
+            },
+            resolveName: async (id) => id,
+            messageText: () => '',
+          },
+          deadlineMs: 1500,
+        },
+      )
+      // Delivered without context, and the 429 was refused at once rather
+      // than waited out (well inside the 1.5 s deadline).
+      expect(meta).toEqual({})
+      expect(Date.now() - t0).toBeLessThan(1000)
+      expect(hits.filter((h) => h === 'conversations.info')).toHaveLength(1)
+      expect(hits.filter((h) => h === 'conversations.replies')).toHaveLength(1)
+      // The main client is untouched by the context 429: a reply posts now.
+      const t1 = Date.now()
+      const posted = await mainClient.chat.postMessage({ channel: 'C1', text: 'reply' })
+      expect(posted.ok).toBe(true)
+      expect(Date.now() - t1).toBeLessThan(1000)
+      expect(hits).toEqual(['conversations.info', 'conversations.replies', 'chat.postMessage'])
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  test('wiring: context lookups never go through the main client', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain(
+      'const threadContextWeb = new WebClient(botToken, CONTEXT_LOOKUP_CLIENT_OPTIONS)',
+    )
+    expect(src).not.toMatch(/resolveChannelName\(\s*web\b/)
+    expect(src).not.toMatch(/inboundContextMeta\(\s*web\b/)
+    expect(src).not.toMatch(/threadContextDeps\(\s*web\b/)
+    const deps = src.slice(src.indexOf('function threadContextDeps('))
+    const depsBody = deps.slice(0, deps.indexOf('\n}\n'))
+    expect(depsBody).toContain('resolveName: resolveContextUserName')
+    expect(depsBody).not.toMatch(/\bweb\./)
+    const rcu = src.slice(src.indexOf('const resolveContextUserName = createUserNameResolver({'))
+    expect(rcu.slice(0, 200)).toContain('threadContextWeb.users.info({ user })')
   })
 })

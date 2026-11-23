@@ -137,6 +137,7 @@ import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 import {
   BoundedTtlCache,
   buildInboundContextMeta,
+  CONTEXT_LOOKUP_CLIENT_OPTIONS,
   cardTitleMeta,
   channelNameMeta,
   createUserNameResolver,
@@ -320,6 +321,9 @@ const contextWeb = new WebClient(botToken, {
   retryConfig: { retries: 0 },
   rejectRateLimitedCalls: true,
 })
+// Thread-context and channel-name lookups get their own client too (see
+// CONTEXT_LOOKUP_CLIENT_OPTIONS): a rate limit there never stalls replies.
+const threadContextWeb = new WebClient(botToken, CONTEXT_LOOKUP_CLIENT_OPTIONS)
 const lastBotContext = createLastBotContext(
   (args) => contextWeb.conversations.history(args),
   () => ({ userId: botUserId, botId: selfBotId }),
@@ -899,6 +903,14 @@ function threadMessageText(m: Record<string, unknown>): string {
   return typeof m.text === 'string' ? m.text : ''
 }
 
+/** Quoted-author names for thread context, over the context client; shares
+ *  the sanitized name cache with resolveUserName. */
+const resolveContextUserName = createUserNameResolver({
+  usersInfo: (user) => threadContextWeb.users.info({ user }),
+  sanitize: sanitizeDisplayName,
+  cache: userNameCache,
+})
+
 function threadContextDeps(client: WebClient): ThreadContextDeps {
   return {
     async fetchReplies(channel, threadTs) {
@@ -908,7 +920,7 @@ function threadContextDeps(client: WebClient): ThreadContextDeps {
         hasMore: res.has_more === true,
       }
     },
-    resolveName: resolveUserName,
+    resolveName: resolveContextUserName,
     messageText: threadMessageText,
   }
 }
@@ -3379,7 +3391,7 @@ async function deliverButtonClick(
   }
   if (threadTs !== undefined) meta.thread_ts = threadTs
   const channelName = await withDeadline(
-    resolveChannelName(web, channelId),
+    resolveChannelName(threadContextWeb, channelId),
     METADATA_DEADLINE_MS,
     undefined,
   )
@@ -3737,7 +3749,10 @@ async function deliverEvent(
   // Top-level only: the bot's previous message in this conversation, quoted.
   Object.assign(meta, await getLastBotContext())
   // Channel name + quoted thread context for a thread reply (part C).
-  Object.assign(meta, await inboundContextMeta(web, channelId, ev.ts as string, incomingThreadTs))
+  Object.assign(
+    meta,
+    await inboundContextMeta(threadContextWeb, channelId, ev.ts as string, incomingThreadTs),
+  )
 
   const evFiles = ev.files as any[] | undefined
   if (evFiles?.length) {
