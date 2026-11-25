@@ -77,6 +77,7 @@ import {
   type PendingPolicyApproval,
   parseExpectedGenesisArg,
   parseMinEventsArg,
+  parsePermissionRelay,
   parseSendableRoots,
   parseV2FloorSeqArg,
   parseVerifyArg,
@@ -305,9 +306,12 @@ const { botToken, appToken, secretValues, secretPlaceholders } = loadEnv()
 // Slack clients
 // ---------------------------------------------------------------------------
 
-const web = new WebClient(botToken)
+// A Web API network error carries the HTTP request, whose header holds the token.
+// Never attach it: these errors reach console.error, which Claude Code keeps in its MCP logs.
+const web = new WebClient(botToken, { attachOriginalToWebAPIRequestError: false })
 // Keep optional context off the primary client's request queue and retry path.
 const contextWeb = new WebClient(botToken, {
+  attachOriginalToWebAPIRequestError: false,
   timeout: 300,
   retryConfig: { retries: 0 },
   rejectRateLimitedCalls: true,
@@ -320,7 +324,10 @@ const lastBotContext = createLastBotContext(
   () => ({ userId: botUserId, botId: selfBotId }),
 )
 trackBotMessages(web.chat, lastBotContext.remember)
-const socket = new SocketModeClient({ appToken })
+const socket = new SocketModeClient({
+  appToken,
+  clientOptions: { attachOriginalToWebAPIRequestError: false },
+})
 
 let botUserId = ''
 // Settles once the boot-time web.auth.test() attempt completes (success OR
@@ -901,13 +908,24 @@ async function inboundContextMeta(
 // MCP Server
 // ---------------------------------------------------------------------------
 
+// SLACK_PERMISSION_RELAY=off keeps tool-approval prompts in the terminal: the
+// capability is not declared, so Claude Code never sends them to Slack. Read
+// from the process environment only; loadEnv() ignores it in the state-dir .env.
+const PERMISSION_RELAY = parsePermissionRelay(process.env.SLACK_PERMISSION_RELAY)
+if (!PERMISSION_RELAY) {
+  console.error(
+    '[slack] permission relay OFF (SLACK_PERMISSION_RELAY is set to something other than "on"): ' +
+      'tool-approval prompts stay in the terminal and plugin policy rules do not run for them.',
+  )
+}
+
 const mcp = new Server(
   { name: 'slack', version: '0.1.0' },
   {
     capabilities: {
       experimental: {
         'claude/channel': {},
-        'claude/channel/permission': {},
+        ...(PERMISSION_RELAY ? { 'claude/channel/permission': {} } : {}),
       },
       tools: {},
     },
@@ -2607,6 +2625,8 @@ mcp.setNotificationHandler(
   }: {
     params: { request_id: string; tool_name: string; description: string; input_preview: string }
   }) => {
+    // Second layer: the capability is not declared, so this should never arrive.
+    if (!PERMISSION_RELAY) return
     if (!VALID_REQUEST_ID.test(params.request_id)) return
 
     const access = getAccess()
