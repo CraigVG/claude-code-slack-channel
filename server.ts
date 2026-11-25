@@ -305,22 +305,31 @@ const { botToken, appToken, secretValues, secretPlaceholders } = loadEnv()
 // Slack clients
 // ---------------------------------------------------------------------------
 
-const web = new WebClient(botToken)
+// A Web API network error carries the HTTP request, whose header holds the token.
+// Never attach it: these errors reach console.error, which Claude Code keeps in its MCP logs.
+const web = new WebClient(botToken, { attachOriginalToWebAPIRequestError: false })
 // Keep optional context off the primary client's request queue and retry path.
 const contextWeb = new WebClient(botToken, {
+  attachOriginalToWebAPIRequestError: false,
   timeout: 300,
   retryConfig: { retries: 0 },
   rejectRateLimitedCalls: true,
 })
 // Thread-parent lookups get their own client too (see
 // CONTEXT_LOOKUP_CLIENT_OPTIONS): a rate limit there never stalls replies.
-const threadContextWeb = new WebClient(botToken, CONTEXT_LOOKUP_CLIENT_OPTIONS)
+const threadContextWeb = new WebClient(botToken, {
+  ...CONTEXT_LOOKUP_CLIENT_OPTIONS,
+  attachOriginalToWebAPIRequestError: false,
+})
 const lastBotContext = createLastBotContext(
   (args) => contextWeb.conversations.history(args),
   () => ({ userId: botUserId, botId: selfBotId }),
 )
 trackBotMessages(web.chat, lastBotContext.remember)
-const socket = new SocketModeClient({ appToken })
+const socket = new SocketModeClient({
+  appToken,
+  clientOptions: { attachOriginalToWebAPIRequestError: false },
+})
 
 let botUserId = ''
 // Settles once the boot-time web.auth.test() attempt completes (success OR
@@ -901,13 +910,17 @@ async function inboundContextMeta(
 // MCP Server
 // ---------------------------------------------------------------------------
 
+// SLACK_PERMISSION_RELAY=off keeps tool-approval prompts in the terminal: the
+// capability is not declared, so Claude Code never sends them to Slack.
+const PERMISSION_RELAY = (process.env.SLACK_PERMISSION_RELAY || '').toLowerCase() !== 'off'
+
 const mcp = new Server(
   { name: 'slack', version: '0.1.0' },
   {
     capabilities: {
       experimental: {
         'claude/channel': {},
-        'claude/channel/permission': {},
+        ...(PERMISSION_RELAY ? { 'claude/channel/permission': {} } : {}),
       },
       tools: {},
     },
