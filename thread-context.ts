@@ -172,6 +172,7 @@ export function threadContextMeta(parent: ThreadParent | undefined): Record<stri
  *  out Retry-After (which can be 30 minutes); other failures get a few quick
  *  retries. The caller delivers without context on any failure. */
 export const CONTEXT_LOOKUP_CLIENT_OPTIONS = {
+  attachOriginalToWebAPIRequestError: false, // see `web` in server.ts
   timeout: 5_000,
   retryConfig: { retries: 2, factor: 2, minTimeout: 200, maxTimeout: 1_000 },
   rejectRateLimitedCalls: true,

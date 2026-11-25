@@ -317,10 +317,7 @@ const contextWeb = new WebClient(botToken, {
 })
 // Thread-parent lookups get their own client too (see
 // CONTEXT_LOOKUP_CLIENT_OPTIONS): a rate limit there never stalls replies.
-const threadContextWeb = new WebClient(botToken, {
-  ...CONTEXT_LOOKUP_CLIENT_OPTIONS,
-  attachOriginalToWebAPIRequestError: false,
-})
+const threadContextWeb = new WebClient(botToken, CONTEXT_LOOKUP_CLIENT_OPTIONS)
 const lastBotContext = createLastBotContext(
   (args) => contextWeb.conversations.history(args),
   () => ({ userId: botUserId, botId: selfBotId }),
