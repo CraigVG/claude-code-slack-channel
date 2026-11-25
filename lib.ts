@@ -1487,6 +1487,16 @@ export function parseSendableRoots(raw: string | undefined): string[] {
   return out
 }
 
+/**
+ * Reads SLACK_PERMISSION_RELAY. Unset, empty or "on" (trimmed, any case) relays
+ * tool-approval prompts to Slack. Any other value, typos included, turns the
+ * relay off, so a mistyped "off" never leaves approvals answerable from Slack.
+ */
+export function parsePermissionRelay(raw: string | undefined): boolean {
+  const value = (raw ?? '').trim().toLowerCase()
+  return value === '' || value === 'on'
+}
+
 /** Fail-fast validator for SLACK_SENDABLE_ROOTS at server boot (ccsc-a9z).
  *
  *  Throws with a detailed message listing every root that could not be
